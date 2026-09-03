@@ -1,23 +1,11 @@
 # SBE1V1K Factory eMMC Layout
 
-This document records the factory eMMC user-area layout captured in:
+This document describes the supported factory eMMC user-area layout.
+The eMMC hardware boot areas, `boot0` and `boot1`, are separate from the GPT
+partitions and must be backed up separately or included in a complete backup archive.
 
-```text
-/home/yyh/Desktop/private/qsdk/backup/mmcblk0.img
-sha256: b2a04915f89fdd1fdb19ebfdd5a091b2e3207f6ab0f171bcc6b8c0802dda2cf8
-```
-
-The eMMC boot areas are backed up separately:
-
-```text
-/home/yyh/Desktop/private/qsdk/backup/mmcblk0boot0.bin
-/home/yyh/Desktop/private/qsdk/backup/mmcblk0boot1.bin
-sha256: bb9f8df61474d25e71fa00722318cd387396ca1736605e1248821cc0de3d3af8
-```
-
-`sgdisk` reports the primary GPT as valid and the secondary GPT as corrupt
-because factory p43 `ASKEYMFC` reaches the final sector. The migration layout
-below leaves room for a valid secondary GPT.
+Factory p43 `ASKEYMFC` can reach the final sector and overlap the secondary GPT.
+The migration layout below leaves room for a valid secondary GPT.
 
 The recovery migration check intentionally does not require `ASKEYMFC` to be
 resolvable by U-Boot. Some factory images expose the same corrupt-secondary-GPT
@@ -84,30 +72,29 @@ slot 1: 0:HLOS_1, rootfs_1, rootfs_data_1
 Do not install the chainloader into `0:HLOS` or `0:HLOS_1`. Those 7 MiB
 partitions are part of the Askey dual-image verification and backup flow.
 
-The captured image shows `rsvd_2` and `rsvd_3` completely filled with the eMMC
-erase value (`0xff`). Both factory rootfs images were also inspected: neither
-accesses those two partition labels. In contrast, `rsvd_1` is checked as an
-Askey-signed repair payload during preinit and must remain available for that
-purpose. The `mainline` recovery profile therefore stores the 4 MiB chainloader
+Keep `rsvd_1` available for the factory repair flow.
+The `mainline` recovery profile stores the 4 MiB chainloader
 image at the start of `rsvd_2` (LBA `5201954`, `0x4f6022`) without using either
 HLOS slot.
+
+QWRT compatibility uses the factory-compatible partition map, with the
+chainloader preserved in `rsvd_2`.
 
 ## Large Chainloader Migration Layout
 
 The table below is the layout produced from the standard factory GPT above.
-The recovery code does not require every source GPT to have the same tail
-partition set: it preserves all existing partitions ending before LBA
-`110626` (`0x1b022`) and deletes/rebuilds the region from that LBA onward.
-On variants that omit `0:HLOS_1`, the numeric partition indices after `0:HLOS`
-will differ, but the target labels and LBAs remain the same.
+Recovery requires the exact P1-P25 prefix. If the source omits P26 `0:HLOS_1`,
+it copies P25 `0:HLOS` into the unallocated 7 MiB slot and verifies the copy
+before writing the GPT. This keeps the large-layout partition numbers stable.
 
 | Start | End | Sectors | Size | Name |
 | ---: | ---: | ---: | ---: | --- |
-| before 110626 (`0x1b022`) | unchanged | unchanged | unchanged | existing labels |
-| 110626 (`0x1b022`) | 118817 | 8192 (`0x2000`) | 4 MiB | `chainloader` |
-| 118818 (`0x1d022`) | 184353 | 65536 (`0x10000`) | 32 MiB | `kernel` |
-| 184354 (`0x2d022`) | 2281505 | 2097152 (`0x200000`) | 1 GiB | `rootfs` |
-| 2281506 (`0x22d022`) | 15269854 | 12988349 | about 6.2 GiB | `rootfs_data` |
+| before 96290 (`0x17822`) | unchanged | unchanged | unchanged | P1-P25 |
+| 96290 (`0x17822`) | 110625 | 14336 (`0x3800`) | 7 MiB | P26 `0:HLOS_1` |
+| 110626 (`0x1b022`) | 118817 | 8192 (`0x2000`) | 4 MiB | P27 `chainloader` |
+| 118818 (`0x1d022`) | 184353 | 65536 (`0x10000`) | 32 MiB | P28 `kernel` |
+| 184354 (`0x2d022`) | 2281505 | 2097152 (`0x200000`) | 1 GiB | P29 `rootfs` |
+| 2281506 (`0x22d022`) | 15269854 | 12988349 | about 6.2 GiB | P30 `rootfs_data` |
 
 This is a raw eMMC/GPT layout. `rootfs_data` is a GPT partition label, not a UBI
 volume, and the SBE1V1K recovery path must not use UBI management for firmware
@@ -144,9 +131,10 @@ In the HTTP page, run `Repartition factory eMMC` with confirmation token:
 SBE1V1K_REPARTITION
 ```
 
-The action verifies the factory GPT, preserves the running FIT from
+The action verifies the exact P1-P25 factory prefix, preserves the running FIT from
 `0x44000000` or `0x80000000` (falling back to the current eMMC chainloader
-partition), writes the migration GPT and selected chainloader target, and
+partition), clones and verifies `0:HLOS` into P26 when `0:HLOS_1` is absent,
+writes the migration GPT and selected chainloader target, and
 updates `0:APPSBLENV` with `fw_setenv`-equivalent variable changes while
 preserving other entries.
 The APPSBLENV partition is read back after writing so the migration fails if

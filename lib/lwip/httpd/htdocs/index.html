@@ -371,6 +371,9 @@ button{touch-action:manipulation}
 .backup-help{min-height:20px;margin:8px 0 0;color:var(--muted);font-size:12px}
 .backup-help.error{color:var(--danger)}
 .backup-help.ok{color:var(--green)}
+.restore-section{margin-top:25px;padding-top:23px;border-top:1px solid var(--line)}
+.restore-section .warning{margin-top:20px}
+.restore-confirm{margin-top:20px}
 .footer{padding:14px 3px 0;color:var(--footer-ink);font-size:11px;text-align:right}
 [hidden]{display:none!important}
 @keyframes page-in{from{transform:translateY(6px)}to{transform:none}}
@@ -540,21 +543,49 @@ button{touch-action:manipulation}
             <button class="primary-button" id="backup-button" type="button" disabled>Download partition</button>
             <button class="primary-button" id="backup-all-button" type="button" disabled>Download all (.tar)</button>
           </div>
+
+          <div class="restore-section">
+            <label class="backup-label" for="restore-file-input">Restore raw partition backup</label>
+            <input class="file-input" id="restore-file-input" type="file" accept=".bin,.img">
+            <div class="file-picker" id="restore-file-picker">
+              <button class="choose-button" id="restore-choose-button" type="button">Choose backup</button>
+              <span class="file-name" id="restore-file-name">No backup selected</span>
+              <span class="file-size" id="restore-file-size"></span>
+            </div>
+            <p class="backup-help" id="restore-help">Select a partition and its exact-size raw backup.</p>
+
+            <div class="warning">
+              <span class="warning-mark">!</span>
+              <div>
+                <strong>Destructive partition restore</strong>
+                <p>The complete selected partition is erased before the backup is written. Do not power off.</p>
+              </div>
+            </div>
+
+            <div class="restore-confirm">
+              <label class="confirm-label" for="restore-confirm-input">Type <span id="restore-token">SBE1V1K_RESTORE:&lt;partition&gt;</span> to confirm</label>
+              <input class="confirm-input" id="restore-confirm-input" type="text" autocomplete="off" spellcheck="false" placeholder="Select a partition first">
+            </div>
+            <div class="actions">
+              <p class="action-note">Only an individual raw backup is accepted; all.tar cannot be restored here.</p>
+              <button class="danger-button" id="restore-button" type="button" disabled>Erase and restore partition</button>
+            </div>
+          </div>
         </div>
 
         <section class="progress-section" id="progress-section" aria-label="Operation progress">
           <div class="progress-inner">
             <div class="progress-head"><strong>Progress</strong><span id="progress-detail"></span></div>
             <p class="status-message" id="status-message">Select an image to begin.</p>
-            <div class="progress-row" id="row-upload">
-              <span class="progress-label">Upload</span>
-              <div class="progress-track"><div class="progress-fill" id="upload-fill"></div></div>
-              <span class="progress-percent" id="upload-percent">0%</span>
-            </div>
             <div class="progress-row" id="row-erase">
               <span class="progress-label">Erase</span>
               <div class="progress-track"><div class="progress-fill" id="erase-fill"></div></div>
               <span class="progress-percent" id="erase-percent">0%</span>
+            </div>
+            <div class="progress-row" id="row-upload">
+              <span class="progress-label">Upload</span>
+              <div class="progress-track"><div class="progress-fill" id="upload-fill"></div></div>
+              <span class="progress-percent" id="upload-percent">0%</span>
             </div>
             <div class="progress-row" id="row-write">
               <span class="progress-label">Write</span>
@@ -579,12 +610,19 @@ var fileInspection=0;
 var activeDiskLayout="unknown";
 var firmwareKernelPad=32*1024*1024;
 var firmwareMax=1024*1024*1024;
+var firmwareLocked=false;
+var qwrtUnlocked=false;
 var busy=false;
 var pollTimer=null;
 var pollEpoch=0;
 var pollOutcome=0;
 var countdownStarted=false;
 var uploadStarted=false;
+var restoreFile=null;
+var restoreOffset=0;
+var restoreInProgress=false;
+var restoreChunkActive=false;
+var restoreChunkSize=16*1024*1024;
 
 var profiles={
   firmware:{
@@ -637,18 +675,28 @@ var profiles={
   }
 };
 
+var qwrtRiskWarning=[
+  "قد يمحو برنامج QWRT الثابت قسم CDT في الجهاز، مما قد يمنع الجهاز من الإقلاع. بتأكيد التهيئة، فإنك تقر بفهم هذا الخطر وقبوله. لا يتحمل المؤلف مسؤولية أي تلف للجهاز أو فقدان للبيانات ينتج عن ذلك.",
+  "QWRT 固件可能擦除设备的 CDT 分区，导致设备无法启动。确认格式化即表示您已了解并接受此风险；作者不对由此造成的设备损坏或数据丢失承担责任。",
+  "QWRT firmware may erase the device's CDT partition, potentially preventing the device from booting. By confirming formatting, you acknowledge and accept this risk. The author is not liable for any resulting device damage or data loss.",
+  "Le firmware QWRT peut effacer la partition CDT de l'appareil, ce qui peut empêcher son démarrage. En confirmant le formatage, vous reconnaissez et acceptez ce risque. L'auteur décline toute responsabilité en cas de dommages à l'appareil ou de perte de données qui en résulteraient.",
+  "Прошивка QWRT может стереть раздел CDT, после чего устройство не сможет загрузиться. Подтверждая форматирование, вы признаёте, что понимаете и принимаете этот риск. Автор не несёт ответственности за возникшие в результате повреждения устройства или потерю данных.",
+  "El firmware QWRT puede borrar la partición CDT del dispositivo, impidiendo que arranque. Al confirmar el formateo, declara que comprende y acepta este riesgo. El autor no se responsabiliza de los daños al dispositivo ni de la pérdida de datos que puedan producirse."
+].join("\n\n");
+
 var layoutProfiles={
   mainline:{
     target:"Mainline / factory GPT",
     method:"Rebuild factory-compatible tail",
     limit:"LBA 110626",
-    copy:"Uses the OpenWrt mainline partition map and keeps the original service partitions.",
+    copy:"Uses the OpenWrt mainline partition map and restores a missing HLOS_1 from HLOS.",
     help:"Kernel: 0:HLOS · Root: rootfs · Chainloader: rsvd_2",
     warningTitle:"Rebuilds the factory-compatible tail",
     warning:"The selected firmware targets and rsvd_2 are erased. Upload a mainline sysupgrade image before rebooting.",
     action:"Apply mainline layout",
     rows:[
       ["0:HLOS","81954","7 MiB","Boot FIT"],
+      ["0:HLOS_1","96290","7 MiB","Backup boot FIT"],
       ["rootfs","110626","122 MiB","SquashFS"],
       ["rootfs_data","610338","512 MiB","Persistent data"],
       ["rsvd_2","5201954","32 MiB","Chainloader FIT"]
@@ -658,16 +706,34 @@ var layoutProfiles={
     target:"Large OpenWrt layout",
     method:"Keep prefix, rebuild tail",
     limit:"LBA 110626",
-    copy:"Partitions before LBA 110626 are preserved; the tail is rebuilt as shown.",
+    copy:"P1-P25 are verified; a missing P26 HLOS_1 is restored from HLOS before migration.",
     help:"Kernel: kernel · Root: rootfs · Chainloader: chainloader",
     warningTitle:"Erases the current tail layout",
     warning:"The current tail partitions are replaced. Upload a large-layout recovery image before rebooting.",
     action:"Apply large layout",
     rows:[
+      ["0:HLOS_1","96290","7 MiB","Backup boot FIT"],
       ["chainloader","110626","4 MiB","U-Boot FIT"],
       ["kernel","118818","32 MiB","Boot FIT"],
       ["rootfs","184354","1 GiB","SquashFS"],
       ["rootfs_data","2281506","Remaining","Persistent data"]
+    ]
+  },
+  qwrt:{
+    target:"QWRT factory GPT",
+    method:"Factory-compatible QWRT profile",
+    limit:"LBA 110626",
+    copy:"Matches the QWRT wiping-firmware map and refreshes the device-bound authorization value before firmware erase.",
+    help:"Kernel: 0:HLOS · Root: rootfs · Chainloader: rsvd_2",
+    warningTitle:"Applies the QWRT factory profile",
+    warning:"The factory-compatible GPT is verified or rebuilt as needed. QWRT authorization is written to APPSBLENV before any destructive operation.",
+    action:"Enable QWRT profile",
+    rows:[
+      ["0:HLOS","81954","7 MiB","Boot FIT"],
+      ["0:HLOS_1","96290","7 MiB","Backup boot FIT"],
+      ["rootfs","110626","122 MiB","SquashFS + embedded overlay"],
+      ["rootfs_data","610338","512 MiB","Persistent data"],
+      ["rsvd_2","5201954","32 MiB","Chainloader FIT"]
     ]
   }
 };
@@ -686,6 +752,14 @@ var partitionSelect=document.getElementById("partition-select");
 var backupButton=document.getElementById("backup-button");
 var backupAllButton=document.getElementById("backup-all-button");
 var backupHelp=document.getElementById("backup-help");
+var restoreFileInput=document.getElementById("restore-file-input");
+var restoreChooseButton=document.getElementById("restore-choose-button");
+var restoreFileName=document.getElementById("restore-file-name");
+var restoreFileSize=document.getElementById("restore-file-size");
+var restoreHelp=document.getElementById("restore-help");
+var restoreConfirmInput=document.getElementById("restore-confirm-input");
+var restoreButton=document.getElementById("restore-button");
+var restoreToken=document.getElementById("restore-token");
 var state=document.getElementById("state");
 var statusMessage=document.getElementById("status-message");
 var partitions=[];
@@ -700,11 +774,58 @@ function formatBytes(bytes){
   return(bytes/(1024*1024*1024)).toFixed(2)+" GiB";
 }
 
-function configureActiveLayout(layout,kernelPad,maxSize){
-  activeDiskLayout=layoutProfiles[layout]?layout:"unknown";
+function rawLayoutForProfile(layout){
+  return layout==="qwrt"?"mainline":layout;
+}
+
+function setQwrtVisibility(unlocked){
+  qwrtUnlocked=!!unlocked;
+  var option=layoutSelect.querySelector('option[value="qwrt"]');
+  if(qwrtUnlocked){
+    if(!option){
+      option=document.createElement("option");
+      option.value="qwrt";
+      option.textContent="QWRT factory storage";
+      layoutSelect.appendChild(option);
+    }
+  }else{
+    if(option)option.remove();
+    if(layoutSelect.value==="qwrt")layoutSelect.value="mainline";
+  }
+}
+
+function configureActiveLayout(layout,kernelPad,maxSize,locked,unlocked){
+  activeDiskLayout=(layout==="mainline"||layout==="large"||layout==="qwrt")?layout:(layout==="factory"?"factory":"unknown");
+  setQwrtVisibility(unlocked);
+  firmwareLocked=!!locked||(layout==="qwrt"&&!qwrtUnlocked);
   firmwareKernelPad=kernelPad||32*1024*1024;
   firmwareMax=maxSize||1024*1024*1024;
-  if(activeDiskLayout==="mainline"){
+  if(firmwareLocked){
+    if(layout==="qwrt"&&!locked){
+      profiles.firmware.copy="QWRT firmware compatibility.";
+      profiles.firmware.target="Unavailable";
+      profiles.firmware.limit="Unavailable";
+      profiles.firmware.help="The selected firmware target is currently unavailable.";
+      profiles.firmware.warning="Firmware writes are currently unavailable.";
+      profiles.firmware.note="Use firmware matching the selected layout.";
+      profiles.uboot.target="chainloader";
+      profiles.uboot.warning="chainloader is erased before writing. A failed transfer can break recovery boot.";
+      if(selectedFile)validateFile();
+      return;
+    }
+    profiles.firmware.copy="Migrate the verified factory partition map before flashing OpenWrt.";
+    profiles.firmware.target="Layout migration required";
+    profiles.firmware.limit="Locked until migration";
+    profiles.firmware.help="Use eMMC layout to select mainline or large storage, then upload matching firmware.";
+    profiles.firmware.warning="Firmware writes are disabled on this pre-migration factory GPT.";
+    profiles.firmware.note="The factory partition tail has not been accepted as a firmware target.";
+    profiles.uboot.target=layout==="factory"?"rsvd_2":"Unavailable";
+    profiles.uboot.warning=layout==="factory"?"rsvd_2 is erased before writing. A failed transfer can break recovery boot.":"The chainloader target is unavailable until the partition map is identified.";
+    if(selectedFile)validateFile();
+    return;
+  }
+  profiles.firmware.copy="Flash an OpenWrt sysupgrade image.";
+  if(activeDiskLayout==="mainline"||activeDiskLayout==="qwrt"){
     profiles.firmware.target="0:HLOS + rootfs";
     profiles.firmware.limit="Up to "+formatBytes(firmwareMax);
     profiles.firmware.help="Select a mainline sysupgrade tar or matching raw recovery image.";
@@ -802,9 +923,10 @@ function inspectSelectedFile(){
 function fileError(){
   if(!selectedFile)return"";
   if(selectedFileFormat==="pending")return"";
+  if(activeView==="firmware"&&firmwareLocked)return"Firmware upload is locked until a verified eMMC layout migration completes.";
   if(selectedFileFormat==="unknown")return"Image must be a FIT-based raw image or an OpenWrt sysupgrade tar.";
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&selectedRawLayout==="unknown")return"Raw firmware has no SquashFS at a supported layout boundary.";
-  if(activeView==="firmware"&&selectedFileFormat==="raw"&&layoutProfiles[activeDiskLayout]&&selectedRawLayout!==activeDiskLayout)return"Raw firmware is for the "+selectedRawLayout+" layout, not the current "+activeDiskLayout+" layout.";
+  if(activeView==="firmware"&&selectedFileFormat==="raw"&&layoutProfiles[activeDiskLayout]&&selectedRawLayout!==rawLayoutForProfile(activeDiskLayout))return"Raw firmware is for the "+selectedRawLayout+" layout, not the current "+activeDiskLayout+" layout.";
   if(activeView==="firmware"&&selectedFileFormat==="raw"&&selectedFile.size<=firmwareKernelPad)return"Raw firmware must be larger than the "+formatBytes(firmwareKernelPad)+" kernel area.";
   if(activeView==="firmware"&&selectedFile.size>firmwareMax)return"Firmware must not exceed "+formatBytes(firmwareMax)+".";
   if(activeView==="uboot"&&selectedFileFormat!=="raw")return"Chainloader must be a raw FIT image.";
@@ -872,10 +994,13 @@ function validateFile(){
 }
 
 function validateConfirmation(){
-  repartitionButton.disabled=busy||confirmInput.value!=="SBE1V1K_REPARTITION";
+  var qwrt=layoutSelect.value==="qwrt";
+  var authorized=!qwrt||qwrtUnlocked;
+  repartitionButton.disabled=busy||confirmInput.value!=="SBE1V1K_REPARTITION"||!authorized;
   if(!busy&&activeView==="layout"&&confirmInput.value){
-    if(repartitionButton.disabled)setState("Confirm","error","Token does not match.");
-    else setState("Ready","success","Ready to repartition.");
+    if(confirmInput.value!=="SBE1V1K_REPARTITION")setState("Confirm","error","Token does not match.");
+    else if(qwrt&&!qwrtUnlocked)setState("Unavailable","idle","The selected profile is currently unavailable.");
+    else setState("Ready","success","Ready to apply the selected profile.");
   }
 }
 
@@ -885,18 +1010,67 @@ function setBusy(value){
   confirmInput.disabled=value;
   layoutSelect.disabled=value;
   partitionSelect.disabled=value||!partitionsLoaded;
+  restoreChooseButton.disabled=value;
+  restoreConfirmInput.disabled=value;
   var buttons=document.querySelectorAll(".nav-button");
   for(var i=0;i<buttons.length;i++)buttons[i].disabled=value;
   uploadButton.disabled=value||!selectedFile||selectedFileFormat==="pending"||!!fileError();
-  repartitionButton.disabled=value||confirmInput.value!=="SBE1V1K_REPARTITION";
+  repartitionButton.disabled=value||confirmInput.value!=="SBE1V1K_REPARTITION"||
+    (layoutSelect.value==="qwrt"&&!qwrtUnlocked);
   backupButton.disabled=value||!partitionSelect.value;
   backupAllButton.disabled=value||!partitionsLoaded||!partitions.length;
+  updateRestoreControls();
 }
 
 function selectedPartition(){
   var id=partitionSelect.value;
   for(var i=0;i<partitions.length;i++)if(partitions[i].id===id)return partitions[i];
   return null;
+}
+
+function restoreConfirmationToken(){
+  var part=selectedPartition();
+  return part?"SBE1V1K_RESTORE:"+part.id:"";
+}
+
+function restoreFileError(){
+  var part=selectedPartition();
+  if(!part)return"Select the target partition first.";
+  if(!restoreFile)return"";
+  if(!restoreFile.size)return"The backup file is empty.";
+  if(restoreFile.size!==part.size)return"Backup size "+formatBytes(restoreFile.size)+" does not match the partition size "+formatBytes(part.size)+".";
+  return"";
+}
+
+function updateRestoreControls(){
+  var part=selectedPartition();
+  var token=restoreConfirmationToken();
+  var error=restoreFileError();
+  restoreToken.textContent=token||"SBE1V1K_RESTORE:<partition>";
+  restoreConfirmInput.placeholder=token||"Select a partition first";
+  restoreFileName.textContent=restoreFile?restoreFile.name:"No backup selected";
+  restoreFileName.className="file-name"+(restoreFile?" selected":"");
+  restoreFileSize.textContent=restoreFile?formatBytes(restoreFile.size):"";
+  restoreHelp.className="backup-help";
+  if(error&&restoreFile){
+    restoreHelp.textContent=error;
+    restoreHelp.classList.add("error");
+  }else if(restoreFile&&part){
+    restoreHelp.textContent="Raw backup size matches "+(part.kind==="hardware"?part.name:"P"+part.number+" / "+part.name)+".";
+    restoreHelp.classList.add("ok");
+  }else if(part){
+    restoreHelp.textContent="Select an exact "+formatBytes(part.size)+" raw backup file.";
+  }else{
+    restoreHelp.textContent="Select a partition and its exact-size raw backup.";
+  }
+  restoreButton.disabled=busy||!part||!restoreFile||!!error||restoreConfirmInput.value!==token;
+}
+
+function clearRestoreFile(){
+  restoreFile=null;
+  restoreFileInput.value="";
+  restoreConfirmInput.value="";
+  updateRestoreControls();
 }
 
 function updateBackupSelection(){
@@ -910,6 +1084,7 @@ function updateBackupSelection(){
       backupHelp.textContent="Choose one eMMC area or GPT partition.";
       setState("Idle","idle","Choose a partition to download.");
     }
+    updateRestoreControls();
     return;
   }
   var target=part.kind==="hardware"?part.name:"P"+part.number+" / "+part.name;
@@ -918,6 +1093,7 @@ function updateBackupSelection(){
   backupHelp.textContent=(part.kind==="hardware"?"Hardware boot area; ":"Starts at LBA "+part.start+"; ")+part.blocks+" logical blocks.";
   backupHelp.classList.add("ok");
   setState("Ready","success","Partition is ready for a read-only download.");
+  updateRestoreControls();
 }
 
 async function loadPartitions(){
@@ -982,7 +1158,7 @@ function setView(view){
   document.getElementById("upload-view").hidden=!upload;
   document.getElementById("layout-view").hidden=!layout;
   document.getElementById("backup-view").hidden=!backup;
-  document.getElementById("progress-section").hidden=backup;
+  document.getElementById("progress-section").hidden=backup&&!restoreInProgress;
   document.getElementById("row-upload").hidden=layout;
   resetProgress();
   if(upload){
@@ -1006,10 +1182,95 @@ function updateServerProgress(data){
     setProgress("write",0,"");
     setState("Erasing","working","Target partitions are being erased. Do not disconnect power.");
   }else if(phase===2){
-    setProgress("erase",100,"complete");
+    setProgress("erase",data.erase_total?100:0,data.erase_total?"complete":"");
     setProgress("write",data.write_total?data.write_done*100/data.write_total:0,"active");
-    setState("Writing","working",activeView==="layout"?"Writing the new partition layout.":"Streaming image data directly to eMMC.");
+    setState("Writing","working",activeView==="layout"?
+      (layoutSelect.value==="qwrt"?"Applying QWRT compatibility settings.":"Writing the new partition layout."):
+      "Streaming image data directly to eMMC.");
   }
+}
+
+function failRestore(label,message){
+  restoreChunkActive=false;
+  restoreInProgress=false;
+  restoreConfirmInput.value="";
+  pollOutcome=-1;
+  stopPolling();
+  setState(label,"error",message);
+  setBusy(false);
+}
+
+function sendRestoreChunk(){
+  var part=selectedPartition();
+  if(!restoreInProgress||restoreChunkActive||pollOutcome!==0||!part||!restoreFile)return;
+  if(restoreOffset>=restoreFile.size){
+    setState("Finalizing","working","Partition data written. Verifying server status.");
+    pollStatus(pollEpoch);
+    return;
+  }
+
+  var start=restoreOffset;
+  var end=Math.min(start+restoreChunkSize,restoreFile.size);
+  var body=restoreFile.slice(start,end);
+  var xhr=new XMLHttpRequest();
+  restoreChunkActive=true;
+  xhr.upload.addEventListener("progress",function(event){
+    if(!event.lengthComputable)return;
+    var loaded=start+event.loaded;
+    setProgress("upload",loaded*100/restoreFile.size,"active");
+    document.getElementById("progress-detail").textContent=formatBytes(loaded)+" / "+formatBytes(restoreFile.size);
+    setState("Restoring","working","Uploading and writing the selected partition in 16 MiB chunks.");
+  });
+  xhr.addEventListener("load",function(){
+    restoreChunkActive=false;
+    if(xhr.status<200||xhr.status>=300){
+      failRestore("Rejected","The server rejected a restore chunk. Review the serial console before retrying.");
+      return;
+    }
+    restoreOffset=end;
+    setProgress("upload",restoreOffset*100/restoreFile.size,restoreOffset===restoreFile.size?"complete":"active");
+    if(restoreOffset<restoreFile.size)sendRestoreChunk();
+    else pollStatus(pollEpoch);
+  });
+  xhr.addEventListener("error",function(){
+    failRestore("Network error","The partition restore was interrupted after erase. Retry with the same complete backup.");
+  });
+  xhr.open("POST","/upload/restore?id="+encodeURIComponent(part.id)+"&offset="+start+"&total="+restoreFile.size,true);
+  xhr.setRequestHeader("Content-Type","application/octet-stream");
+  xhr.send(body);
+}
+
+function restorePartition(){
+  var part=selectedPartition();
+  var token=restoreConfirmationToken();
+  if(busy||!part||!restoreFile||restoreFileError()||restoreConfirmInput.value!==token)return;
+
+  restoreInProgress=true;
+  restoreChunkActive=false;
+  restoreOffset=0;
+  setBusy(true);
+  document.getElementById("progress-section").hidden=false;
+  resetProgress("Submitting the confirmed partition restore request.");
+  pollEpoch++;
+  pollOutcome=0;
+  setState("Preparing","working","The complete target partition will now be erased.");
+
+  var xhr=new XMLHttpRequest();
+  xhr.addEventListener("load",function(){
+    if(xhr.status<200||xhr.status>=300){
+      failRestore("Rejected","The server rejected the restore confirmation. Review the serial console.");
+      return;
+    }
+    setState("Erasing","working","The selected partition is being erased. Do not disconnect power.");
+    startPolling();
+    pollStatus(pollEpoch);
+  });
+  xhr.addEventListener("error",function(){
+    failRestore("Network error","The restore confirmation request was interrupted.");
+  });
+  xhr.open("POST","/action/prepare/restore?id="+encodeURIComponent(part.id)+"&size="+restoreFile.size,true);
+  xhr.setRequestHeader("Content-Type","text/plain");
+  xhr.send(token);
 }
 
 function stopPolling(){
@@ -1035,13 +1296,29 @@ async function pollStatus(epoch){
     if(epoch!==pollEpoch||pollOutcome!==0)return;
     if(data.prepared){
       setProgress("erase",100,"complete");
-      setState("Prepared","working","Target erase complete. Starting the image stream.");
-      sendUpload();
+      if(restoreInProgress){
+        setState("Prepared","working","Target erase complete. Starting partition restore.");
+        sendRestoreChunk();
+      }else{
+        setState("Prepared","working","Target erase complete. Starting the image stream.");
+        sendUpload();
+      }
     }else if(data.in_progress){
       updateServerProgress(data);
     }else if(data.ok){
       pollOutcome=1;
       stopPolling();
+      if(restoreInProgress){
+        restoreInProgress=false;
+        restoreChunkActive=false;
+        restoreConfirmInput.value="";
+        setProgress("upload",100,"complete");
+        setProgress("erase",100,"complete");
+        setProgress("write",100,"complete");
+        setState("Complete","success","Partition restore complete. The recovery server remains available.");
+        setBusy(false);
+        return;
+      }
       if(activeView!=="layout")setProgress("upload",100,"complete");
       setProgress("erase",100,"complete");
       setProgress("write",100,"complete");
@@ -1049,18 +1326,24 @@ async function pollStatus(epoch){
       else{
         if(activeView==="layout"){
           if(layoutSelect.value==="mainline")configureActiveLayout("mainline",7*1024*1024,129*1024*1024);
+          else if(layoutSelect.value==="qwrt")configureActiveLayout("qwrt",7*1024*1024,129*1024*1024,false,true);
           else configureActiveLayout("large",32*1024*1024,1024*1024*1024);
           partitionsLoaded=false;
           loadPartitions();
         }
-        setState("Complete","success","eMMC migration complete. Upload firmware before rebooting.");
+        setState("Complete","success",layoutSelect.value==="qwrt"?
+          "QWRT profile enabled. Upload matching firmware.":
+          "eMMC migration complete. Upload firmware before rebooting.");
         setBusy(false);
       }
     }else if(data.error){
-      pollOutcome=-1;
-      stopPolling();
-      setState("Failed","error","Operation failed. Review the serial console before retrying.");
-      setBusy(false);
+      if(restoreInProgress)failRestore("Failed","Partition restore failed. Review the serial console before retrying.");
+      else{
+        pollOutcome=-1;
+        stopPolling();
+        setState("Failed","error","Operation failed. Review the serial console before retrying.");
+        setBusy(false);
+      }
     }
   }catch(error){}
 }
@@ -1141,7 +1424,7 @@ function upload(){
 }
 
 function repartition(){
-  if(confirmInput.value!=="SBE1V1K_REPARTITION"||busy)return;
+  if(repartitionButton.disabled||busy)return;
   setBusy(true);
   resetProgress("Submitting factory migration request.");
   pollEpoch++;
@@ -1224,9 +1507,26 @@ uploadButton.addEventListener("click",upload);
 confirmInput.addEventListener("input",validateConfirmation);
 repartitionButton.addEventListener("click",repartition);
 layoutSelect.addEventListener("change",updateLayoutSelection);
-partitionSelect.addEventListener("change",updateBackupSelection);
+partitionSelect.addEventListener("change",function(){clearRestoreFile();updateBackupSelection()});
 backupButton.addEventListener("click",downloadBackup);
 backupAllButton.addEventListener("click",downloadAllBackups);
+restoreChooseButton.addEventListener("click",function(){if(!busy)restoreFileInput.click()});
+restoreFileInput.addEventListener("change",function(){restoreFile=this.files[0]||null;restoreConfirmInput.value="";updateRestoreControls()});
+restoreConfirmInput.addEventListener("input",updateRestoreControls);
+restoreButton.addEventListener("click",restorePartition);
+var restoreFilePicker=document.getElementById("restore-file-picker");
+restoreFilePicker.addEventListener("dragover",function(event){
+  event.preventDefault();
+  if(!busy)restoreFilePicker.classList.add("dragover");
+});
+restoreFilePicker.addEventListener("dragleave",function(){restoreFilePicker.classList.remove("dragover")});
+restoreFilePicker.addEventListener("drop",function(event){
+  event.preventDefault();
+  restoreFilePicker.classList.remove("dragover");
+  if(busy)return;
+  var files=event.dataTransfer&&event.dataTransfer.files;
+  if(files&&files[0]){restoreFile=files[0];restoreFileInput.value="";restoreConfirmInput.value="";updateRestoreControls()}
+});
 window.addEventListener("beforeunload",function(event){
   if(!busy)return;
   event.preventDefault();
@@ -1237,21 +1537,31 @@ window.addEventListener("hashchange",function(){
   if(!busy&&profiles[view]&&view!==activeView)setView(view);
 });
 
+var aboutInitialized=false;
+async function refreshAbout(initial){
+  try{
+    var response=await fetch("/about",{cache:"no-store"});
+    var data=await response.json();
+    if(!data||!data.u_boot)return;
+    var wasUnlocked=qwrtUnlocked;
+    document.getElementById("side-version").textContent=data.u_boot;
+    document.getElementById("footer-version").textContent=data.u_boot;
+    configureActiveLayout(data.layout,Number(data.kernel_pad),Number(data.firmware_max),Boolean(data.firmware_locked),Boolean(data.qwrt_unlocked));
+    if((initial||(!wasUnlocked&&qwrtUnlocked&&data.layout==="qwrt"))&&
+       layoutProfiles[data.layout]&&
+       (data.layout!=="qwrt"||qwrtUnlocked))layoutSelect.value=data.layout;
+    updateLayoutSelection();
+    aboutInitialized=true;
+  }catch(error){}
+}
+
 (async function(){
   var requested=location.hash.substring(1);
   setView(profiles[requested]?requested:"firmware");
   loadPartitions();
-  try{
-    var response=await fetch("/about",{cache:"no-store"});
-    var data=await response.json();
-    if(data&&data.u_boot){
-      document.getElementById("side-version").textContent=data.u_boot;
-      document.getElementById("footer-version").textContent=data.u_boot;
-      configureActiveLayout(data.layout,Number(data.kernel_pad),Number(data.firmware_max));
-      if(layoutProfiles[data.layout])layoutSelect.value=data.layout;
-      if(!busy)setView(activeView);
-    }
-  }catch(error){}
+  await refreshAbout(true);
+  if(!aboutInitialized)setQwrtVisibility(false);
+  setInterval(function(){if(!busy)refreshAbout(false)},1000);
 })();
 </script>
 </body>

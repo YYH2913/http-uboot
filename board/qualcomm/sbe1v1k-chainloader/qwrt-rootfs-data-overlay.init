@@ -1,0 +1,34 @@
+#!/bin/sh
+
+# Direct U-Boot writes leave the large-layout data partition blank.
+sbe1v1k_prepare_rootfs_data() {
+	local uevent data dev sectors fstype
+
+	[ "$INITRAMFS" = "1" ] && return 0
+	grep -qw "root=/dev/mmcblk0p29" /proc/cmdline || return 0
+	grep -qw "fstools_ignore_partname=1" /proc/cmdline && return 0
+
+	for uevent in /sys/class/block/mmcblk0p*/uevent; do
+		[ -r "$uevent" ] || continue
+		grep -qx "PARTNAME=rootfs_data" "$uevent" || continue
+		dev=${uevent%/uevent}
+		dev=${dev##*/}
+		data="/dev/$dev"
+		break
+	done
+	[ -n "$data" ] || return 0
+
+	sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null)
+	case "$sectors" in
+		""|*[!0-9]*) return 0 ;;
+	esac
+	[ "$sectors" -ge 1048576 ] || return 0
+
+	fstype=$(blkid -s TYPE -o value "$data" 2>/dev/null)
+	[ -n "$fstype" ] && return 0
+
+	echo "SBE1V1K: initializing rootfs_data overlay" >/dev/console
+	mkfs.ext4 -F -q -L rootfs_data "$data" >/dev/null 2>&1
+}
+
+boot_hook_add preinit_main sbe1v1k_prepare_rootfs_data

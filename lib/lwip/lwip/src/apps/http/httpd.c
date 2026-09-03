@@ -2460,6 +2460,13 @@ http_err(void *arg, err_t err)
   LWIP_DEBUGF(HTTPD_DEBUG, ("http_err: %s\n", lwip_strerr(err)));
 
   if (hs != NULL) {
+#if LWIP_HTTPD_SUPPORT_POST
+    if (hs->post_content_len_left != 0) {
+      /* Notify the application so interrupted streaming POSTs are aborted. */
+      http_uri_buf[0] = 0;
+      httpd_post_finished(hs, http_uri_buf, LWIP_HTTPD_URI_BUF_LEN);
+    }
+#endif /* LWIP_HTTPD_SUPPORT_POST */
     http_state_free(hs);
   }
 }

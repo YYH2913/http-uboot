@@ -30,11 +30,13 @@
 #include <asm/global_data.h>
 #include <dm/pinctrl.h>
 #include <dm/uclass.h>
+#include <button.h>
 
 #ifdef crc32
 #undef crc32
 #endif
 #include <u-boot/crc.h>
+#include <u-boot/sha256.h>
 
 #include <lwip/netif.h>
 #include <lwip/pbuf.h>
@@ -115,6 +117,7 @@ static bool recovery_board_is_sbe1v1k(void)
 #define RECOVERY_MMC_WRITE_CHUNK    (1024 * 1024UL)
 #define RECOVERY_MMC_STREAM_CHUNK   (1024 * 1024UL)
 #define RECOVERY_MMC_BACKUP_CHUNK   (16 * 1024 * 1024UL)
+#define RECOVERY_MMC_RESTORE_CHUNK  (16 * 1024 * 1024UL)
 #define RECOVERY_MMC_ERASE_CHUNK    (32 * 1024 * 1024ULL)
 #define RECOVERY_MMC_ERASE_PROGRESS_STEPS 1000U
 #define RECOVERY_SQUASHFS_MAGIC      0x73717368U
@@ -123,6 +126,8 @@ static bool recovery_board_is_sbe1v1k(void)
 #define RECOVERY_SQUASHFS_BYTES_OFF  40U
 #define RECOVERY_SQUASHFS_HEADER_MIN 48U
 #define RECOVERY_REPARTITION_MAX    64UL
+#define RECOVERY_RESTORE_BODY_MAX   96UL
+#define RECOVERY_RESTORE_ID_MAX     32U
 #define RECOVERY_SBE1V1K_GPT_MAX    12288UL
 #define RECOVERY_SBE1V1K_CHAINLOADER_START 110626ULL
 #define RECOVERY_SBE1V1K_CHAINLOADER_SIZE  8192ULL
@@ -139,6 +144,11 @@ static bool recovery_board_is_sbe1v1k(void)
 #define RECOVERY_SBE1V1K_MAINLINE_DATA_SIZE    1048576ULL
 #define RECOVERY_SBE1V1K_MAINLINE_UBOOT_START  5201954ULL
 #define RECOVERY_SBE1V1K_MAINLINE_UBOOT_SIZE   65536ULL
+#define RECOVERY_SBE1V1K_HLOS_START            81954ULL
+#define RECOVERY_SBE1V1K_HLOS_SIZE             14336ULL
+#define RECOVERY_SBE1V1K_HLOS_1_START          96290ULL
+#define RECOVERY_SBE1V1K_HLOS_1_SIZE           14336ULL
+#define RECOVERY_SBE1V1K_HLOS_1_TYPE_GUID      "A71DA577-7F81-4626-B4A2-E377F9174525"
 #define RECOVERY_SBE1V1K_FIT_TFTP_ADDR         0x80000000UL
 #define RECOVERY_SBE1V1K_FIT_PERSISTENT_ADDR   0x44000000UL
 #define RECOVERY_GPT_TYPE_BASIC_DATA       "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
@@ -195,13 +205,23 @@ static bool recovery_board_is_sbe1v1k(void)
 #define RECOVERY_APPSBLENV_SIZE (256 * 1024UL)
 #define RECOVERY_ENV_CRC_SIZE   4
 #define RECOVERY_SBE1V1K_REPARTITION_TOKEN "SBE1V1K_REPARTITION"
+#define RECOVERY_SBE1V1K_RESTORE_TOKEN "SBE1V1K_RESTORE"
 #define RECOVERY_SBE1V1K_CHAINLOADER_PART "0#chainloader"
+#define RECOVERY_SBE1V1K_FACTORY_UBOOT_PART "0#rsvd_2"
+#define RECOVERY_SBE1V1K_LAYOUT_ENV "sbe1v1k_partition_profile"
+#define RECOVERY_QWRT_AUTH_CODE_LEN (SHA256_SUM_LEN * 2U)
+#define RECOVERY_QWRT_SERIAL_MAX 32U
+#define RECOVERY_QWRT_BUTTON_PRESSES 5U
+#define RECOVERY_QWRT_BUTTON_WINDOW_MS 10000UL
 #define RECOVERY_PARTITIONS_JSON_MAX (32 * 1024UL)
 #define RECOVERY_BACKUP_MAGIC         0x52424b50U
 #define RECOVERY_BACKUP_NAME_MAX      100U
 #define RECOVERY_TAR_BLOCK_SIZE       512ULL
 #define RECOVERY_TAR_END_SIZE         (2 * RECOVERY_TAR_BLOCK_SIZE)
 #define RECOVERY_TAR_MAX_MEMBER_SIZE  ((8ULL * 1024 * 1024 * 1024) - 1)
+#define RECOVERY_TAR_CHKSUM_OFF        148U
+#define RECOVERY_TAR_CHKSUM_LEN        8U
+#define RECOVERY_SBE1V1K_CONTROL_MAX   256U
 #define RECOVERY_PREPARE_BODY_MAX     32U
 #define RECOVERY_PREPARE_START_DELAY_MS 100U
 
@@ -280,9 +300,11 @@ static u32 recv_off;
 static u32 recv_total;
 static int post_ok;
 static int upload_done;
+static void *post_connection;
 static struct recovery_status_led_ctrl *recovery_runtime_status_leds;
 static int flash_request;
 static int prepare_request;
+static int restore_prepare_request;
 static volatile int reboot_request;
 static unsigned int recovery_backup_active;
 /* Progress for /status polling */
@@ -299,6 +321,32 @@ static unsigned long long prog_erase_volume_base;
 static unsigned long long prog_erase_volume_bytes;
 static struct recovery_status_led_ctrl *prog_status_leds;
 
+struct recovery_restore_state {
+	bool active;
+	bool prepared;
+	bool receiving;
+	struct blk_desc *desc;
+	struct recovery_backup_source source;
+	u8 *buf;
+	size_t buf_size;
+	size_t buf_used;
+	unsigned long long total;
+	unsigned long long written;
+	unsigned long long chunk_offset;
+	unsigned int chunk_received;
+	char id[RECOVERY_RESTORE_ID_MAX];
+};
+
+static struct recovery_restore_state recovery_restore;
+static bool current_restore_prepare;
+static bool current_restore_chunk;
+static char current_restore_id[RECOVERY_RESTORE_ID_MAX];
+static unsigned long long current_restore_size;
+static unsigned long long current_restore_offset;
+static u8 current_restore_body[RECOVERY_RESTORE_BODY_MAX + 1];
+static char restore_prepare_id[RECOVERY_RESTORE_ID_MAX];
+static unsigned long long restore_prepare_size;
+
 static void post_delay_cb(void *arg)
 {
     (void)arg;
@@ -309,6 +357,12 @@ static void prepare_delay_cb(void *arg)
 {
 	(void)arg;
 	prepare_request = 1;
+}
+
+static void restore_prepare_delay_cb(void *arg)
+{
+	(void)arg;
+	restore_prepare_request = 1;
 }
 
 static void reboot_delay_cb(void *arg)
@@ -339,6 +393,7 @@ enum recovery_sbe1v1k_layout {
 	RECOVERY_SBE1V1K_LAYOUT_UNKNOWN = 0,
 	RECOVERY_SBE1V1K_LAYOUT_MAINLINE,
 	RECOVERY_SBE1V1K_LAYOUT_LARGE,
+	RECOVERY_SBE1V1K_LAYOUT_QWRT,
 };
 
 struct recovery_sbe1v1k_layout_desc {
@@ -401,6 +456,27 @@ static const struct recovery_sbe1v1k_layout_desc sbe1v1k_layout_large = {
 	.kernel_pad = RECOVERY_SBE1V1K_KERNEL_SIZE * 512,
 };
 
+/* QWRT follows the factory/"wipe" firmware map, with its own auth contract. */
+static const struct recovery_sbe1v1k_layout_desc sbe1v1k_layout_qwrt = {
+	.id = RECOVERY_SBE1V1K_LAYOUT_QWRT,
+	.name = "qwrt",
+	.kernel_part = "0#0:HLOS",
+	.rootfs_part = "0#rootfs",
+	.data_part = "0#rootfs_data",
+	.uboot_part = RECOVERY_SBE1V1K_FACTORY_UBOOT_PART,
+	.kernpart = "0:HLOS",
+	.rootarg = "/dev/mmcblk0p27",
+	.kernel_start = RECOVERY_SBE1V1K_MAINLINE_KERNEL_START,
+	.kernel_size = RECOVERY_SBE1V1K_MAINLINE_KERNEL_SIZE,
+	.rootfs_start = RECOVERY_SBE1V1K_MAINLINE_ROOTFS_START,
+	.rootfs_size = RECOVERY_SBE1V1K_MAINLINE_ROOTFS_SIZE,
+	.data_start = RECOVERY_SBE1V1K_MAINLINE_DATA_START,
+	.data_size = RECOVERY_SBE1V1K_MAINLINE_DATA_SIZE,
+	.uboot_start = RECOVERY_SBE1V1K_MAINLINE_UBOOT_START,
+	.uboot_size = RECOVERY_SBE1V1K_MAINLINE_UBOOT_SIZE,
+	.kernel_pad = RECOVERY_SBE1V1K_MAINLINE_KERNEL_SIZE * 512,
+};
+
 static enum upload_target current_target = TARGET_FIRMWARE;
 static bool current_force_recreate;
 static bool current_prepare_only;
@@ -412,6 +488,23 @@ static enum recovery_sbe1v1k_layout current_repartition_layout =
 	RECOVERY_SBE1V1K_LAYOUT_LARGE;
 static enum recovery_sbe1v1k_layout active_sbe1v1k_layout =
 	RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
+/* A recognised factory GPT is safe to migrate, but not safe to flash in place. */
+static bool sbe1v1k_factory_pre_migration;
+
+/* QWRT is an explicit, session-only capability. */
+static bool qwrt_button_unlocked;
+static unsigned int qwrt_button_presses;
+static ulong qwrt_button_last_press;
+static enum button_state_t qwrt_button_last_state;
+static struct udevice *qwrt_button;
+static bool qwrt_button_available;
+
+static int recovery_read_sbe1v1k_layout_marker(
+	enum recovery_sbe1v1k_layout *layout);
+static int recovery_write_appsblenv(
+	struct recovery_status_led_ctrl *status_leds, size_t progress_base,
+	const struct recovery_sbe1v1k_layout_desc *layout);
+static int recovery_refresh_qwrt_auth_code(void);
 
 enum recovery_backend {
 	RECOVERY_BACKEND_MTD = 0,
@@ -1538,8 +1631,49 @@ static int recovery_format_mmc_part_spec(const char *spec, char *buf,
 	return 0;
 }
 
-static int recovery_get_mmc_part(const char *spec, struct blk_desc **desc,
-				 struct disk_partition *part)
+/*
+ * Resolve GPT labels by walking the table directly.  Some SBE1V1K builds can
+ * print entries beyond the factory prefix but fail the generic name helper
+ * for those same entries.  This still uses the on-device GPT, and callers
+ * validate the resulting partition geometry before any destructive action.
+ */
+static int recovery_get_mmc_part_by_name(const char *part_spec,
+					 struct blk_desc **desc,
+					 struct disk_partition *part)
+{
+	const char *name = strchr(part_spec, '#');
+	char dev_spec[32];
+	size_t dev_len;
+	int part_num;
+	int ret;
+
+	if (!name || !name[1])
+		return -EINVAL;
+
+	dev_len = name - part_spec;
+	if (!dev_len || dev_len >= sizeof(dev_spec))
+		return -ENOSPC;
+	memcpy(dev_spec, part_spec, dev_len);
+	dev_spec[dev_len] = '\0';
+	name++;
+
+	ret = blk_get_device_by_str("mmc", dev_spec, desc);
+	if (ret < 0)
+		return ret;
+
+	for (part_num = 1; part_num <= MAX_SEARCH_PARTITIONS; part_num++) {
+		ret = part_get_info(*desc, part_num, part);
+		if (ret)
+			continue;
+		if (!strcmp(name, (const char *)part->name))
+			return 0;
+	}
+
+	return -ENOENT;
+}
+
+static int recovery_get_mmc_part_ex(const char *spec, struct blk_desc **desc,
+				    struct disk_partition *part, bool quiet)
 {
 	char part_spec[96];
 	int ret;
@@ -1548,13 +1682,22 @@ static int recovery_get_mmc_part(const char *spec, struct blk_desc **desc,
 	if (ret)
 		return ret;
 
-	ret = part_get_info_by_dev_and_name_or_num("mmc", part_spec, desc,
-						   part, false);
-	if (ret < 0)
+	if (strchr(part_spec, '#'))
+		ret = recovery_get_mmc_part_by_name(part_spec, desc, part);
+	else
+		ret = part_get_info_by_dev_and_name_or_num("mmc", part_spec, desc,
+							   part, false);
+	if (ret < 0 && !quiet)
 		printf("Failed to resolve eMMC partition '%s': %d\n",
 		       part_spec, ret);
 
 	return ret < 0 ? ret : 0;
+}
+
+static int recovery_get_mmc_part(const char *spec, struct blk_desc **desc,
+				 struct disk_partition *part)
+{
+	return recovery_get_mmc_part_ex(spec, desc, part, false);
 }
 
 static unsigned long long
@@ -1717,6 +1860,7 @@ struct recovery_tar_header {
 	char devmajor[8];
 	char devminor[8];
 	char prefix[155];
+	char padding[12];
 };
 
 static bool recovery_tar_header_empty(const struct recovery_tar_header *hdr)
@@ -1744,11 +1888,37 @@ static int recovery_tar_octal(const char *field, size_t len, size_t *value)
 			break;
 		if (c < '0' || c > '7')
 			return -EINVAL;
+		if (v > ((size_t)-1 - (c - '0')) / 8)
+			return -EOVERFLOW;
 		v = (v << 3) + c - '0';
 	}
 
 	*value = v;
 	return 0;
+}
+
+static int recovery_tar_verify_checksum(const struct recovery_tar_header *hdr)
+{
+	const u8 *bytes = (const u8 *)hdr;
+	size_t expected;
+	unsigned int checksum = 0;
+	size_t i;
+
+	if (RECOVERY_TAR_CHKSUM_OFF + RECOVERY_TAR_CHKSUM_LEN >
+	    sizeof(*hdr))
+		return -EINVAL;
+	if (recovery_tar_octal(hdr->chksum, sizeof(hdr->chksum), &expected))
+		return -EINVAL;
+
+	for (i = 0; i < sizeof(*hdr); i++) {
+		if (i >= RECOVERY_TAR_CHKSUM_OFF &&
+		    i < RECOVERY_TAR_CHKSUM_OFF + RECOVERY_TAR_CHKSUM_LEN)
+			checksum += ' ';
+		else
+			checksum += bytes[i];
+	}
+
+	return checksum == expected ? 0 : -EBADMSG;
 }
 
 static void recovery_tar_name(const struct recovery_tar_header *hdr,
@@ -1780,25 +1950,384 @@ static void recovery_tar_name(const struct recovery_tar_header *hdr,
 	name[off] = '\0';
 }
 
+static bool recovery_is_control_name(const char *name)
+{
+	return !strcasecmp(recovery_basename(name), "CONTROL");
+}
+
+static const char *
+recovery_sbe1v1k_layout_name(enum recovery_sbe1v1k_layout layout)
+{
+	switch (layout) {
+	case RECOVERY_SBE1V1K_LAYOUT_MAINLINE:
+		return "mainline";
+	case RECOVERY_SBE1V1K_LAYOUT_LARGE:
+		return "large";
+	case RECOVERY_SBE1V1K_LAYOUT_QWRT:
+		return "qwrt";
+	default:
+		return "unknown";
+	}
+}
+
+static int
+recovery_sbe1v1k_tar_layout(const char *board, const char *control_layout,
+			    enum recovery_sbe1v1k_layout *layout)
+{
+	bool spectrum;
+
+	spectrum = !strcmp(board, "spectrum_sbe1v1k") ||
+		!strcmp(board, "spectrum,sbe1v1k");
+	if (spectrum) {
+		/*
+		 * Unmarked Spectrum QSDK/QWRT images use the active GPT profile.
+		 * This keeps the same image compatible with both the factory/mainline
+		 * HLOS layout and the migrated large kernel layout. Repacked images
+		 * may still pin their intended profile with SBE1V1K_LAYOUT.
+		 */
+		if (!control_layout) {
+			if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
+				*layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+			else if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_LARGE)
+				*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+			else
+				*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+			return 0;
+		}
+		if (!strcmp(control_layout, "mainline")) {
+			*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+			return 0;
+		}
+		if (!strcmp(control_layout, "large")) {
+			*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+			return 0;
+		}
+		if (!strcmp(control_layout, "qwrt")) {
+			*layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+			return 0;
+		}
+		return -EINVAL;
+	}
+
+	/* Non-Spectrum identifiers cannot override their fixed layout. */
+	if (control_layout)
+		return -EINVAL;
+
+	/* Factory-compatible non-Spectrum images use the HLOS/rootfs pair. */
+	if (!strcmp(board, "qcom,ipq9574-ap-al02-c4")) {
+		*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+		return 0;
+	}
+
+	if (!strcmp(board, "askey_sbe1v1k") ||
+	    !strcmp(board, "askey,sbe1v1k")) {
+		*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+		return 0;
+	}
+
+	return -ENOENT;
+}
+
+static void recovery_qwrt_secure_zero(void *data, size_t size)
+{
+	volatile u8 *bytes = data;
+
+	while (size--)
+		*bytes++ = 0;
+}
+
+static int recovery_qwrt_serial_from_bootargs(char *serial, size_t size)
+{
+	ofnode chosen;
+	const char *bootargs;
+	const char *value;
+	const char *end;
+	size_t length;
+
+	if (!serial || size < 2)
+		return -EINVAL;
+
+	chosen = ofnode_path("/chosen");
+	if (!ofnode_valid(chosen))
+		return -ENOENT;
+	bootargs = ofnode_read_string(chosen, "bootargs");
+	if (!bootargs)
+		return -ENOENT;
+
+	value = strstr(bootargs, "androidboot.serialno=");
+	if (!value)
+		return -ENOENT;
+	value += strlen("androidboot.serialno=");
+	end = value;
+	while (*end && *end != ' ' && *end != '\t')
+		end++;
+	length = end - value;
+	if (!length || length >= size)
+		return -EINVAL;
+
+	memcpy(serial, value, length);
+	serial[length] = '\0';
+	return 0;
+}
+
+static int recovery_qwrt_normalize_serial(const char *input,
+					   char *serial, size_t size)
+{
+	unsigned long long value;
+	char *end;
+	int ret;
+
+	if (!input || !*input || !serial || size < RECOVERY_QWRT_SERIAL_MAX)
+		return -EINVAL;
+
+	if (!strncmp(input, "0x", 2) || !strncmp(input, "0X", 2)) {
+		value = simple_strtoull(input + 2, &end, 16);
+		if (end == input + 2 || *end)
+			return -EINVAL;
+	} else {
+		value = simple_strtoull(input, &end, 10);
+		if (end == input || *end)
+			return -EINVAL;
+	}
+
+	if (value > 0xffffffffULL)
+		return -ERANGE;
+	ret = snprintf(serial, size, "%llu", value);
+	return ret < 0 || (size_t)ret >= size ? -ENOSPC : 0;
+}
+
+/* The module stores this 28-byte key XORed with 0x5a in its read-only data. */
+static const u8 recovery_qwrt_key_obfuscated[] = {
+	0x0b, 0x0d, 0x08, 0x0e, 0x05, 0x13, 0x0a, 0x0b,
+	0x63, 0x6f, 0x6d, 0x6e, 0x05, 0x68, 0x6a, 0x68,
+	0x6e, 0x05, 0x09, 0x1f, 0x19, 0x08, 0x1f, 0x0e,
+	0x05, 0x11, 0x1f, 0x03,
+};
+
+static void recovery_qwrt_hex_encode(const u8 *data, size_t size, char *hex)
+{
+	static const char digits[] = "0123456789abcdef";
+	size_t i;
+
+	for (i = 0; i < size; i++) {
+		hex[i * 2] = digits[data[i] >> 4];
+		hex[i * 2 + 1] = digits[data[i] & 0xf];
+	}
+	hex[size * 2] = '\0';
+}
+
+/* Reproduce soc_auth.ko's non-destructive auth_code derivation. */
+static int recovery_qwrt_auth_code(char auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1])
+{
+	char raw_serial[RECOVERY_QWRT_SERIAL_MAX];
+	char serial[RECOVERY_QWRT_SERIAL_MAX];
+	const char *env_serial;
+	u8 key[sizeof(recovery_qwrt_key_obfuscated)];
+	u8 digest[SHA256_SUM_LEN];
+	int ret;
+	size_t i;
+
+	env_serial = env_get("serial#");
+	if (env_serial && *env_serial)
+		strlcpy(raw_serial, env_serial, sizeof(raw_serial));
+	else {
+		ret = recovery_qwrt_serial_from_bootargs(raw_serial,
+							 sizeof(raw_serial));
+		if (ret)
+			return ret;
+	}
+
+	ret = recovery_qwrt_normalize_serial(raw_serial, serial,
+					     sizeof(serial));
+	if (ret)
+		return ret;
+
+	for (i = 0; i < sizeof(key); i++)
+		key[i] = recovery_qwrt_key_obfuscated[i] ^ 0x5a;
+	for (i = 0; i < min_t(size_t, strlen(serial), 8); i++)
+		key[20 + i] ^= serial[i];
+
+	ret = sha256_hmac(key, sizeof(key), (const u8 *)serial,
+				  strlen(serial), digest);
+	if (!ret)
+		recovery_qwrt_hex_encode(digest, sizeof(digest), auth_code);
+
+	recovery_qwrt_secure_zero(raw_serial, sizeof(raw_serial));
+	recovery_qwrt_secure_zero(serial, sizeof(serial));
+	recovery_qwrt_secure_zero(key, sizeof(key));
+	recovery_qwrt_secure_zero(digest, sizeof(digest));
+	return ret;
+}
+
+static void recovery_qwrt_button_reset(void)
+{
+	qwrt_button_presses = 0;
+	qwrt_button_last_press = 0;
+}
+
+static void recovery_qwrt_button_init(void)
+{
+	int ret;
+
+	qwrt_button_unlocked = false;
+	qwrt_button_available = false;
+	qwrt_button = NULL;
+	qwrt_button_last_state = BUTTON_OFF;
+	recovery_qwrt_button_reset();
+
+	if (!recovery_board_is_sbe1v1k())
+		return;
+
+	ret = button_get_by_label("reset", &qwrt_button);
+	if (!ret && qwrt_button) {
+		qwrt_button_available = true;
+		qwrt_button_last_state = button_get_state(qwrt_button);
+		if (qwrt_button_last_state < BUTTON_OFF ||
+		    qwrt_button_last_state >= BUTTON_COUNT)
+			qwrt_button_last_state = BUTTON_OFF;
+	}
+}
+
+static void recovery_qwrt_button_poll(void)
+{
+	enum button_state_t state;
+	ulong now;
+
+	if (!qwrt_button_available || qwrt_button_unlocked)
+		return;
+
+	state = button_get_state(qwrt_button);
+	if (state < BUTTON_OFF || state >= BUTTON_COUNT)
+		return;
+
+	if (state == BUTTON_ON && qwrt_button_last_state == BUTTON_OFF) {
+		now = get_timer(0);
+		if (qwrt_button_last_press &&
+		    get_timer(qwrt_button_last_press) > RECOVERY_QWRT_BUTTON_WINDOW_MS)
+			recovery_qwrt_button_reset();
+		if (!qwrt_button_last_press)
+			qwrt_button_last_press = now;
+		if (qwrt_button_presses < RECOVERY_QWRT_BUTTON_PRESSES)
+			qwrt_button_presses++;
+		if (qwrt_button_presses >= RECOVERY_QWRT_BUTTON_PRESSES) {
+			qwrt_button_unlocked = true;
+			/* One-shot session capability; do not persist it in eMMC. */
+			recovery_debug_printf("QWRT partition profile unlocked for this recovery session\n");
+		}
+	}
+
+	qwrt_button_last_state = state;
+}
+
+/*
+ * The older SBE1V1K build identifies itself as the Qualcomm AP-AL02-C4
+ * board. Its own sysupgrade script writes the factory 0:HLOS/rootfs pair,
+ * which is our mainline profile rather than the large chainloader layout.
+ */
+static int recovery_validate_sbe1v1k_tar_control(const void *data, size_t size)
+{
+	static const char board_prefix[] = "BOARD=";
+	static const char layout_prefix[] = "SBE1V1K_LAYOUT=";
+	const u8 *bytes = data;
+	char board[96];
+	char control_layout[16];
+	enum recovery_sbe1v1k_layout image_layout;
+	size_t prefix_len = strlen(board_prefix);
+	size_t layout_prefix_len = strlen(layout_prefix);
+	size_t off = 0;
+	bool found = false;
+	bool layout_found = false;
+	int ret;
+
+	if (!recovery_board_is_sbe1v1k())
+		return 0;
+
+	while (off < size) {
+		size_t line_end = off;
+		size_t board_len;
+		size_t layout_len;
+
+		while (line_end < size && bytes[line_end] != '\n')
+			line_end++;
+		if (line_end > off + prefix_len &&
+		    !memcmp(bytes + off, board_prefix, prefix_len)) {
+			board_len = line_end - off - prefix_len;
+			if (board_len && bytes[off + prefix_len + board_len - 1] == '\r')
+				board_len--;
+			if (found || !board_len || board_len >= sizeof(board))
+				return -EINVAL;
+			memcpy(board, bytes + off + prefix_len, board_len);
+			board[board_len] = '\0';
+			found = true;
+		} else if (line_end > off + layout_prefix_len &&
+			   !memcmp(bytes + off, layout_prefix, layout_prefix_len)) {
+			layout_len = line_end - off - layout_prefix_len;
+			if (layout_len &&
+			    bytes[off + layout_prefix_len + layout_len - 1] == '\r')
+				layout_len--;
+			if (layout_found || !layout_len ||
+			    layout_len >= sizeof(control_layout))
+				return -EINVAL;
+			memcpy(control_layout, bytes + off + layout_prefix_len,
+			       layout_len);
+			control_layout[layout_len] = '\0';
+			layout_found = true;
+		}
+		off = line_end + (line_end < size);
+	}
+
+	if (!found) {
+		printf("SBE1V1K sysupgrade CONTROL has no BOARD entry\n");
+		return -EINVAL;
+	}
+
+	ret = recovery_sbe1v1k_tar_layout(board,
+					 layout_found ? control_layout : NULL,
+					 &image_layout);
+	if (ret) {
+		if (layout_found)
+			printf("SBE1V1K sysupgrade BOARD '%s' does not support layout '%s'\n",
+			       board, control_layout);
+		else
+			printf("SBE1V1K sysupgrade BOARD '%s' is not supported\n", board);
+		return ret;
+	}
+
+	if (active_sbe1v1k_layout != image_layout) {
+		printf("SBE1V1K sysupgrade BOARD '%s' requires the %s partition profile\n",
+		       board, recovery_sbe1v1k_layout_name(image_layout));
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int recovery_tar_extract_firmware(const void *tar, size_t tar_size,
 					 struct recovery_firmware_image *image)
 {
 	const u8 *base = tar;
 	size_t off = 0;
+	bool control_seen = false;
 
 	memset(image, 0, sizeof(*image));
 
 	while (off + 512 <= tar_size) {
 		const struct recovery_tar_header *hdr =
 			(const struct recovery_tar_header *)(base + off);
+		const void *entry = base + off + 512;
 		char name[256];
 		size_t size;
+		bool regular;
+		int ret;
 
 		if (recovery_tar_header_empty(hdr))
 			break;
 
 		if (memcmp(hdr->magic, "ustar", 5))
 			return -EINVAL;
+		ret = recovery_tar_verify_checksum(hdr);
+		if (ret)
+			return ret;
 
 		if (recovery_tar_octal(hdr->size, sizeof(hdr->size), &size))
 			return -EINVAL;
@@ -1807,18 +2336,36 @@ static int recovery_tar_extract_firmware(const void *tar, size_t tar_size,
 			return -EINVAL;
 
 		recovery_tar_name(hdr, name, sizeof(name));
+		regular = hdr->typeflag == '\0' || hdr->typeflag == '0';
 
-		if ((hdr->typeflag == '\0' || hdr->typeflag == '0') &&
-		    !image->kernel.data && recovery_is_kernel_name(name)) {
+		if (recovery_board_is_sbe1v1k() && regular &&
+		    recovery_is_control_name(name)) {
+			if (control_seen)
+				return -EINVAL;
+			control_seen = true;
+			ret = recovery_validate_sbe1v1k_tar_control(entry, size);
+			if (ret)
+				return ret;
+		} else if (regular && !image->kernel.data &&
+			   recovery_is_kernel_name(name)) {
+			if (recovery_board_is_sbe1v1k() && !control_seen) {
+				printf("SBE1V1K sysupgrade CONTROL must precede the kernel payload\n");
+				return -EINVAL;
+			}
 			image->kernel.data = base + off + 512;
 			image->kernel.size = size;
-		} else if ((hdr->typeflag == '\0' || hdr->typeflag == '0') &&
-			   !image->rootfs.data && recovery_is_rootfs_name(name)) {
+		} else if (regular && !image->rootfs.data &&
+			   recovery_is_rootfs_name(name)) {
 			image->rootfs.data = base + off + 512;
 			image->rootfs.size = size;
 		}
 
 		off += 512 + ALIGN(size, 512);
+	}
+
+	if (recovery_board_is_sbe1v1k() && !control_seen) {
+		printf("SBE1V1K sysupgrade tar has no CONTROL member\n");
+		return -EINVAL;
 	}
 
 	return image->kernel.data || image->rootfs.data ? 0 : -ENOENT;
@@ -2136,48 +2683,44 @@ static int recovery_mmc_zero_part(const char *spec,
 	return 0;
 }
 
-static int recovery_mmc_erase_part(const char *spec,
-				   struct recovery_status_led_ctrl *status_leds,
-				   u32 progress_base)
+static int recovery_mmc_erase_resolved(
+	const char *name, struct recovery_status_led_ctrl *status_leds,
+	struct blk_desc *desc, const struct disk_partition *part,
+	u32 progress_base)
 {
-	struct disk_partition part;
-	struct blk_desc *desc;
 	struct mmc *mmc;
 	unsigned long long capacity;
 	lbaint_t chunk_blocks, erased = 0;
 	u32 erase_group;
 	ulong blksz;
 	bool exact;
-	int ret;
 
-	if (!spec || !*spec)
+	if (!name || !*name || !desc || !part || !part->size)
 		return -EINVAL;
 
-	ret = recovery_get_mmc_part(spec, &desc, &part);
-	if (ret)
-		return ret;
-
-	blksz = part.blksz ?: desc->blksz;
-	capacity = recovery_mmc_part_bytes(&part);
+	blksz = part->blksz ?: desc->blksz;
+	if (!blksz || (unsigned long long)part->size > ~0ULL / blksz)
+		return -EOVERFLOW;
+	capacity = (unsigned long long)part->size * blksz;
 	mmc = find_mmc_device(desc->devnum);
 	if (!mmc) {
 		printf("Cannot find eMMC device %d for partition '%s'\n",
-		       desc->devnum, spec);
+		       desc->devnum, name);
 		return -ENODEV;
 	}
 
 	erase_group = mmc->erase_grp_size;
 	exact = erase_group &&
-		(mmc->can_trim || (!(part.start % erase_group) &&
-				   !(part.size % erase_group)));
+		(mmc->can_trim || (!(part->start % erase_group) &&
+				   !(part->size % erase_group)));
 
 	recovery_debug_printf("Erasing entire eMMC partition '%s' (%llu blocks, %llu bytes)...\n",
-			      spec, (unsigned long long)part.size, capacity);
+			      name, (unsigned long long)part->size, capacity);
 
 	if (!exact) {
 		recovery_debug_printf("eMMC partition '%s' is not erase-group aligned and exact trim is unavailable; zero-filling the complete partition to protect adjacent GPT partitions\n",
-				      spec);
-		return recovery_mmc_zero_part(spec, status_leds, desc, &part,
+				      name);
+		return recovery_mmc_zero_part(name, status_leds, desc, part,
 					      progress_base);
 	}
 
@@ -2189,9 +2732,9 @@ static int recovery_mmc_erase_part(const char *spec,
 	if (!mmc->can_trim)
 		chunk_blocks -= chunk_blocks % erase_group;
 
-	while (erased < part.size) {
-		lbaint_t todo = part.size - erased;
-		lbaint_t blk = part.start + erased;
+	while (erased < part->size) {
+		lbaint_t todo = part->size - erased;
+		lbaint_t blk = part->start + erased;
 
 		if (todo > chunk_blocks)
 			todo = chunk_blocks;
@@ -2199,22 +2742,41 @@ static int recovery_mmc_erase_part(const char *spec,
 			todo -= todo % erase_group;
 		if (!todo) {
 			printf("Cannot safely align eMMC erase for partition '%s'\n",
-			       spec);
+			       name);
 			return -EINVAL;
 		}
 
 		if (blk_derase(desc, blk, todo) != todo) {
 			printf("eMMC erase failed at partition '%s' block " LBAF
-			       " count " LBAF "\n", spec, blk, todo);
+			       " count " LBAF "\n", name, blk, todo);
 			return -EIO;
 		}
 
 		erased += todo;
 		recovery_mmc_update_erase_progress(status_leds, progress_base,
-						   erased, part.size);
+						   erased, part->size);
 	}
 
 	return 0;
+}
+
+static int recovery_mmc_erase_part(const char *spec,
+				   struct recovery_status_led_ctrl *status_leds,
+				   u32 progress_base)
+{
+	struct disk_partition part;
+	struct blk_desc *desc;
+	int ret;
+
+	if (!spec || !*spec)
+		return -EINVAL;
+
+	ret = recovery_get_mmc_part(spec, &desc, &part);
+	if (ret)
+		return ret;
+
+	return recovery_mmc_erase_resolved(spec, status_leds, desc, &part,
+					    progress_base);
 }
 
 #define RECOVERY_MMC_STREAM_PARTS 2
@@ -2231,10 +2793,12 @@ struct recovery_mmc_stream {
 	struct recovery_mmc_stream_part parts[RECOVERY_MMC_STREAM_PARTS];
 	u8 *buf;
 	u8 tar_header[512];
+	u8 tar_control[RECOVERY_SBE1V1K_CONTROL_MAX];
 	size_t buf_size;
 	size_t buf_used;
 	size_t input_received;
 	size_t tar_header_used;
+	size_t tar_control_used;
 	size_t tar_entry_remaining;
 	size_t tar_padding_remaining;
 	int part_count;
@@ -2244,6 +2808,8 @@ struct recovery_mmc_stream {
 	enum upload_target target;
 	enum recovery_stream_format format;
 	size_t total_expected;
+	bool tar_control_active;
+	bool tar_seen_control;
 	bool tar_seen_kernel;
 	bool tar_seen_rootfs;
 	bool tar_end;
@@ -2253,6 +2819,28 @@ struct recovery_mmc_stream {
 
 static struct recovery_mmc_stream recovery_stream;
 static bool recovery_stream_completed;
+
+static int recovery_require_sbe1v1k_firmware_layout(void)
+{
+	if (recovery_board_is_sbe1v1k() &&
+	    active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
+	    !qwrt_button_unlocked) {
+		printf("QWRT firmware operations are unavailable in this recovery session\n");
+		return -EPERM;
+	}
+
+	if (!recovery_board_is_sbe1v1k() ||
+	    active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_MAINLINE ||
+	    active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_LARGE ||
+	    active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
+		return 0;
+
+	if (sbe1v1k_factory_pre_migration)
+		printf("SBE1V1K factory GPT is recognised, but firmware uploads are locked until a verified layout migration completes\n");
+	else
+		printf("SBE1V1K partition profile is unknown; firmware uploads are locked\n");
+	return -EPERM;
+}
 
 static void recovery_mmc_stream_reset(void)
 {
@@ -2300,6 +2888,17 @@ static int recovery_mmc_stream_prepare(enum upload_target target, size_t size,
 					RECOVERY_KERNEL_PAD_SIZE);
 	ulong blksz;
 	int ret;
+
+	if (target == TARGET_FIRMWARE) {
+		ret = recovery_require_sbe1v1k_firmware_layout();
+		if (ret)
+			return ret;
+		ret = recovery_refresh_qwrt_auth_code();
+		if (ret) {
+			printf("Cannot refresh QWRT auth_code before erase: %d\n", ret);
+			return ret;
+		}
+	}
 
 	recovery_mmc_stream_reset();
 	recovery_stream_completed = false;
@@ -2494,13 +3093,33 @@ static int recovery_mmc_stream_tar_header(void)
 		printf("Streamed sysupgrade has an invalid tar header\n");
 		return -EINVAL;
 	}
+	ret = recovery_tar_verify_checksum(hdr);
+	if (ret) {
+		printf("Streamed sysupgrade has an invalid tar checksum\n");
+		return ret;
+	}
 	ret = recovery_tar_octal(hdr->size, sizeof(hdr->size), &entry_size);
 	if (ret)
 		return ret;
 
 	recovery_tar_name(hdr, name, sizeof(name));
 	regular = hdr->typeflag == '\0' || hdr->typeflag == '0';
-	if (regular && recovery_is_kernel_name(name)) {
+	recovery_stream.tar_control_active = false;
+	if (recovery_board_is_sbe1v1k() && regular &&
+	    recovery_is_control_name(name)) {
+		if (recovery_stream.tar_seen_control ||
+		    recovery_stream.tar_seen_kernel || !entry_size ||
+		    entry_size > sizeof(recovery_stream.tar_control))
+			return -EINVAL;
+		recovery_stream.tar_seen_control = true;
+		recovery_stream.tar_control_active = true;
+		recovery_stream.tar_control_used = 0;
+	} else if (regular && recovery_is_kernel_name(name)) {
+		if (recovery_board_is_sbe1v1k() &&
+		    !recovery_stream.tar_seen_control) {
+			printf("SBE1V1K sysupgrade CONTROL must precede the kernel payload\n");
+			return -EINVAL;
+		}
 		if (recovery_stream.tar_seen_kernel || recovery_stream.part_index != 0)
 			return -EINVAL;
 		part_index = 0;
@@ -2533,6 +3152,19 @@ static int recovery_mmc_stream_tar_header(void)
 	return 0;
 }
 
+static int recovery_mmc_stream_finish_control(void)
+{
+	const void *control = recovery_stream.tar_control;
+	size_t control_size = recovery_stream.tar_control_used;
+	int ret;
+
+	ret = recovery_validate_sbe1v1k_tar_control(control, control_size);
+	if (!ret)
+		recovery_stream.tar_control_active = false;
+
+	return ret;
+}
+
 static int recovery_mmc_stream_append_tar(const void *data, size_t size)
 {
 	const u8 *src = data;
@@ -2551,13 +3183,26 @@ static int recovery_mmc_stream_append_tar(const void *data, size_t size)
 				ret = recovery_mmc_stream_append_raw(src, copy);
 				if (ret)
 					return ret;
+			} else if (recovery_stream.tar_control_active) {
+				if (copy > sizeof(recovery_stream.tar_control) -
+				    recovery_stream.tar_control_used)
+					return -EFBIG;
+				memcpy(recovery_stream.tar_control +
+				       recovery_stream.tar_control_used, src, copy);
+				recovery_stream.tar_control_used += copy;
 			}
 			recovery_stream.tar_entry_remaining -= copy;
 			recovery_stream.input_received += copy;
 			src += copy;
 			size -= copy;
-			if (!recovery_stream.tar_entry_remaining)
+			if (!recovery_stream.tar_entry_remaining) {
+				if (recovery_stream.tar_control_active) {
+					ret = recovery_mmc_stream_finish_control();
+					if (ret)
+						return ret;
+				}
 				recovery_stream.tar_part_index = -1;
+			}
 			continue;
 		}
 		if (recovery_stream.tar_padding_remaining) {
@@ -2734,6 +3379,8 @@ static int recovery_mmc_stream_finish(void)
 		return -EIO;
 	if (recovery_stream.format == RECOVERY_STREAM_TAR) {
 		if (!recovery_stream.tar_end ||
+		    (recovery_board_is_sbe1v1k() &&
+		     !recovery_stream.tar_seen_control) ||
 		    !recovery_stream.tar_seen_kernel ||
 		    !recovery_stream.tar_seen_rootfs ||
 		    recovery_stream.parts[0].written !=
@@ -2752,26 +3399,43 @@ static int recovery_mmc_stream_finish(void)
 }
 
 struct recovery_factory_part {
-	const char *spec;
+	const char *name;
 	lbaint_t start;
 	lbaint_t size;
 };
 
 /*
- * Check only the board-unique and boot-chain anchors that must be kept before
- * the chainloader area. SBE1V1K factory/QSDK eMMC layouts are not uniform:
- * some images omit 0:HLOS_1 or move later root/data partitions.
+ * The first 25 entries are invariant across the supported factory, mainline,
+ * and large layouts.  Do not infer a missing HLOS_1 from labels alone: QSDK
+ * code can depend on these numeric partition indices.
  */
 static const struct recovery_factory_part sbe1v1k_factory_parts[] = {
-	{ "0#0:SBL1", 34, 2048 },
-	{ "0#0:APPSBLENV", 28706, 512 },
-	{ "0#0:APPSBL", 29218, 4096 },
-	{ "0#0:APPSBL_1", 33314, 4096 },
-	{ "0#0:ART", 37410, 2048 },
-	{ "0#0:ETHPHYFW", 39458, 1024 },
-	{ "0#0:WIFIFW", 40994, 20480 },
-	{ "0#0:WIFIFW_1", 61474, 20480 },
-	{ "0#0:HLOS", 81954, 14336 },
+	{ "0:SBL1", 34, 2048 },
+	{ "0:SBL1_1", 2082, 2048 },
+	{ "0:BOOTCONFIG", 4130, 1024 },
+	{ "0:BOOTCONFIG1", 5154, 1024 },
+	{ "0:QSEE", 6178, 6144 },
+	{ "0:QSEE_1", 12322, 6144 },
+	{ "0:DEVCFG", 18466, 1024 },
+	{ "0:DEVCFG_1", 19490, 1024 },
+	{ "0:APDP", 20514, 1024 },
+	{ "0:APDP_1", 21538, 1024 },
+	{ "0:TME", 22562, 1024 },
+	{ "0:TME_1", 23586, 1024 },
+	{ "0:RPM", 24610, 1024 },
+	{ "0:RPM_1", 25634, 1024 },
+	{ "0:CDT", 26658, 1024 },
+	{ "0:CDT_1", 27682, 1024 },
+	{ "0:APPSBLENV", 28706, 512 },
+	{ "0:APPSBL", 29218, 4096 },
+	{ "0:APPSBL_1", 33314, 4096 },
+	{ "0:ART", 37410, 2048 },
+	{ "0:ETHPHYFW", 39458, 1024 },
+	{ "0:LICENSE", 40482, 512 },
+	{ "0:WIFIFW", 40994, 20480 },
+	{ "0:WIFIFW_1", 61474, 20480 },
+	{ "0:HLOS", RECOVERY_SBE1V1K_HLOS_START,
+	  RECOVERY_SBE1V1K_HLOS_SIZE },
 };
 
 struct recovery_sbe1v1k_gpt_part {
@@ -2781,7 +3445,7 @@ struct recovery_sbe1v1k_gpt_part {
 	const char *type_guid;
 };
 
-/* Factory-compatible tail used by the OpenWrt mainline partition profile. */
+/* Factory-compatible tail used by the OpenWrt mainline and QWRT profiles. */
 static const struct recovery_sbe1v1k_gpt_part sbe1v1k_mainline_tail[] = {
 	{ "rootfs", 110626, 249856, "98D2248D-7140-449F-A954-39D67BD6C3B4" },
 	{ "rootfs_1", 360482, 249856, "5647B280-DC2A-485D-9913-CF53AC40FA32" },
@@ -2811,6 +3475,8 @@ recovery_sbe1v1k_layout_desc(enum recovery_sbe1v1k_layout layout)
 		return &sbe1v1k_layout_mainline;
 	case RECOVERY_SBE1V1K_LAYOUT_LARGE:
 		return &sbe1v1k_layout_large;
+	case RECOVERY_SBE1V1K_LAYOUT_QWRT:
+		return &sbe1v1k_layout_qwrt;
 	default:
 		return NULL;
 	}
@@ -2925,6 +3591,87 @@ static int recovery_get_mmc_disk_guid(char *buf, size_t size)
 	return 0;
 }
 
+static int recovery_check_sbe1v1k_prefix(struct blk_desc **descp,
+					  bool *has_hlos_1p)
+{
+	struct blk_desc *desc;
+	struct disk_partition part;
+	size_t prefix_count = 0;
+	size_t i;
+	int ret;
+	int p;
+
+	ret = blk_get_device_by_str("mmc", recovery_mmcdev(), &desc);
+	if (ret < 0)
+		return ret;
+	ret = blk_dselect_hwpart(desc, EMMC_HWPART_DEFAULT);
+	if (ret)
+		return ret;
+	if (desc->blksz != 512) {
+		printf("SBE1V1K GPT requires 512-byte logical blocks, found %lu\n",
+		       desc->blksz);
+		return -EINVAL;
+	}
+
+	for (p = 1; p <= MAX_SEARCH_PARTITIONS; p++) {
+		ret = part_get_info(desc, p, &part);
+		if (ret || !part.size ||
+		    part.start >= RECOVERY_SBE1V1K_CHAINLOADER_START)
+			continue;
+
+		if (part.size > RECOVERY_SBE1V1K_CHAINLOADER_START -
+								part.start) {
+			printf("Partition %d '%s' overlaps the HLOS_1/chainloader boundary\n",
+			       p, (const char *)part.name);
+			return -EINVAL;
+		}
+		prefix_count++;
+	}
+
+	if (prefix_count != ARRAY_SIZE(sbe1v1k_factory_parts) &&
+	    prefix_count != ARRAY_SIZE(sbe1v1k_factory_parts) + 1) {
+		printf("SBE1V1K prefix requires exactly 25 or 26 partitions before LBA %llu, found %zu\n",
+		       RECOVERY_SBE1V1K_CHAINLOADER_START, prefix_count);
+		return -EINVAL;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(sbe1v1k_factory_parts); i++) {
+		const struct recovery_factory_part *expect =
+			&sbe1v1k_factory_parts[i];
+
+		ret = part_get_info(desc, i + 1, &part);
+		if (ret || strcmp((const char *)part.name, expect->name) ||
+		    part.start != expect->start || part.size != expect->size) {
+			if (ret)
+				printf("SBE1V1K prefix partition P%zu is missing\n",
+				       i + 1);
+			else
+				printf("SBE1V1K prefix mismatch at P%zu: '%s' start "
+				       LBAF " size " LBAF "\n", i + 1,
+				       (const char *)part.name, part.start, part.size);
+			return ret ?: -EINVAL;
+		}
+	}
+
+	if (prefix_count == ARRAY_SIZE(sbe1v1k_factory_parts) + 1) {
+		p = (int)ARRAY_SIZE(sbe1v1k_factory_parts) + 1;
+		ret = part_get_info(desc, p, &part);
+		if (ret || strcmp((const char *)part.name, "0:HLOS_1") ||
+		    part.start != RECOVERY_SBE1V1K_HLOS_1_START ||
+		    part.size != RECOVERY_SBE1V1K_HLOS_1_SIZE) {
+			printf("SBE1V1K P26 must be the standard 0:HLOS_1 partition\n");
+			return ret ?: -EINVAL;
+		}
+		*has_hlos_1p = true;
+	} else {
+		*has_hlos_1p = false;
+	}
+
+	if (descp)
+		*descp = desc;
+	return 0;
+}
+
 static int recovery_build_sbe1v1k_gpt(
 	const struct recovery_sbe1v1k_layout_desc *layout, char **gptp)
 {
@@ -2933,12 +3680,12 @@ static int recovery_build_sbe1v1k_gpt(
 	char *gpt;
 	size_t off = 0;
 	bool has_hlos_1 = false;
-	int preserved = 0;
+	size_t preserved = 0;
 	int ret;
 	int p;
 
-	ret = blk_get_device_by_str("mmc", recovery_mmcdev(), &desc);
-	if (ret < 0)
+	ret = recovery_check_sbe1v1k_prefix(&desc, &has_hlos_1);
+	if (ret)
 		return ret;
 
 	ret = recovery_get_mmc_disk_guid(disk_guid, sizeof(disk_guid));
@@ -2987,30 +3734,25 @@ static int recovery_build_sbe1v1k_gpt(
 		preserved++;
 	}
 
-	if (!preserved) {
+	if (preserved != ARRAY_SIZE(sbe1v1k_factory_parts) + has_hlos_1) {
+		printf("SBE1V1K prefix changed while building the target GPT\n");
 		ret = -EINVAL;
 		goto err;
 	}
 
-	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_MAINLINE) {
-		size_t i;
-
-		if (preserved != (has_hlos_1 ? 26 : 25)) {
-			printf("Mainline profile requires 25 or 26 standard prefix partitions, found %d\n",
-			       preserved);
-			ret = -EINVAL;
+	if (!has_hlos_1) {
+		ret = recovery_append_gpt_part(
+			gpt, RECOVERY_SBE1V1K_GPT_MAX, &off,
+			"0:HLOS_1", RECOVERY_SBE1V1K_HLOS_1_START,
+			RECOVERY_SBE1V1K_HLOS_1_SIZE, desc->blksz,
+			RECOVERY_SBE1V1K_HLOS_1_TYPE_GUID, NULL, false);
+		if (ret)
 			goto err;
-		}
+	}
 
-		if (!has_hlos_1) {
-			ret = recovery_append_gpt_part(
-				gpt, RECOVERY_SBE1V1K_GPT_MAX, &off,
-				"0:HLOS_1", 96290, 14336, desc->blksz,
-				"A71DA577-7F81-4626-B4A2-E377F9174525",
-				NULL, false);
-			if (ret)
-				goto err;
-		}
+	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_MAINLINE ||
+	    layout->id == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+		size_t i;
 
 		for (i = 0; i < ARRAY_SIZE(sbe1v1k_mainline_tail); i++) {
 			const struct recovery_sbe1v1k_gpt_part *part =
@@ -3063,7 +3805,7 @@ static int recovery_build_sbe1v1k_gpt(
 			goto err;
 	}
 
-	recovery_debug_printf("Building SBE1V1K '%s' GPT; preserving %d partitions before LBA %llu\n",
+	recovery_debug_printf("Building SBE1V1K '%s' GPT; preserving %zu partitions before LBA %llu\n",
 			      layout->name, preserved,
 			      RECOVERY_SBE1V1K_CHAINLOADER_START);
 	*gptp = gpt;
@@ -3074,9 +3816,10 @@ err:
 	return ret;
 }
 
-static int recovery_verify_factory_gpt(struct recovery_status_led_ctrl *status_leds)
+static int recovery_verify_factory_gpt(
+	struct recovery_status_led_ctrl *status_leds, bool *has_hlos_1p)
 {
-	size_t i;
+	int ret;
 
 	prog_phase = 1;
 	prog_erase_done = 0;
@@ -3086,69 +3829,180 @@ static int recovery_verify_factory_gpt(struct recovery_status_led_ctrl *status_l
 	prog_total = prog_erase_total;
 	prog_done = 0;
 
-	for (i = 0; i < ARRAY_SIZE(sbe1v1k_factory_parts); i++) {
-		const struct recovery_factory_part *expect =
-			&sbe1v1k_factory_parts[i];
-		struct disk_partition part;
-		struct blk_desc *desc;
-		int ret;
+	ret = recovery_check_sbe1v1k_prefix(NULL, has_hlos_1p);
+	if (ret)
+		return ret;
 
-		ret = recovery_get_mmc_part(expect->spec, &desc, &part);
-		if (ret)
-			return ret;
-
-		if (part.start != expect->start || part.size != expect->size) {
-			printf("Factory GPT check failed for '%s': start " LBAF
-			       " size " LBAF ", expected start " LBAF
-			       " size " LBAF "\n",
-			       expect->spec, part.start, part.size,
-			       expect->start, expect->size);
-			return -EINVAL;
-		}
-
-		prog_erase_done = i + 1;
-		prog_done = prog_erase_done;
-		recovery_service_runtime(status_leds);
-	}
+	prog_erase_done = prog_erase_total;
+	prog_done = prog_erase_done;
+	recovery_service_runtime(status_leds);
 
 	return 0;
 }
 
-static int recovery_verify_sbe1v1k_gpt(
-	const struct recovery_sbe1v1k_layout_desc *layout)
+static int recovery_clone_sbe1v1k_hlos_1(
+	struct recovery_status_led_ctrl *status_leds, size_t progress_base)
+{
+	struct disk_partition hlos;
+	struct blk_desc *desc;
+	lbaint_t chunk_blocks;
+	lbaint_t copied = 0;
+	ulong chunk_size;
+	u8 *source_buf;
+	u8 *verify_buf;
+	int ret;
+
+	ret = recovery_get_mmc_part("0#0:HLOS", &desc, &hlos);
+	if (ret)
+		return ret;
+	if (hlos.start != RECOVERY_SBE1V1K_HLOS_START ||
+	    hlos.size != RECOVERY_SBE1V1K_HLOS_SIZE ||
+	    (hlos.blksz ?: desc->blksz) != desc->blksz) {
+		printf("Refusing to clone a non-standard 0:HLOS partition\n");
+		return -EINVAL;
+	}
+
+	chunk_size = ALIGN(RECOVERY_MMC_WRITE_CHUNK, desc->blksz);
+	chunk_blocks = chunk_size / desc->blksz;
+	source_buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
+	verify_buf = memalign(ARCH_DMA_MINALIGN, chunk_size);
+	if (!source_buf || !verify_buf) {
+		free(source_buf);
+		free(verify_buf);
+		return -ENOMEM;
+	}
+
+	while (copied < hlos.size) {
+		lbaint_t todo = hlos.size - copied;
+
+		if (todo > chunk_blocks)
+			todo = chunk_blocks;
+		if (blk_dread(desc, hlos.start + copied, todo, source_buf) != todo) {
+			printf("Failed to read 0:HLOS while creating 0:HLOS_1\n");
+			ret = -EIO;
+			goto out;
+		}
+		if (blk_dwrite(desc, RECOVERY_SBE1V1K_HLOS_1_START + copied,
+			       todo, source_buf) != todo) {
+			printf("Failed to write the new 0:HLOS_1 data\n");
+			ret = -EIO;
+			goto out;
+		}
+		memset(verify_buf, 0, todo * desc->blksz);
+		if (blk_dread(desc, RECOVERY_SBE1V1K_HLOS_1_START + copied,
+			      todo, verify_buf) != todo ||
+		    memcmp(source_buf, verify_buf, todo * desc->blksz)) {
+			printf("0:HLOS_1 read-back verification failed\n");
+			ret = -EIO;
+			goto out;
+		}
+
+		copied += todo;
+		prog_write_done = progress_base + (size_t)copied * desc->blksz;
+		prog_done = prog_erase_done + prog_write_done;
+		recovery_service_runtime(status_leds);
+	}
+
+	recovery_debug_printf("Cloned 0:HLOS into the missing 0:HLOS_1 slot\n");
+	ret = 0;
+
+out:
+	free(source_buf);
+	free(verify_buf);
+	return ret;
+}
+
+/*
+ * Some factory/QSDK images omit 0:HLOS_1 and use a different tail.  They
+ * still retain the immutable boot-chain prefix and the stock rsvd_2 boot
+ * location.  Recognise only that exact combination so recovery can migrate
+ * it without treating the unverified tail as a writable firmware profile.
+ */
+static int recovery_verify_sbe1v1k_factory_boot_path(void)
 {
 	struct disk_partition part;
 	struct blk_desc *desc;
+	bool has_hlos_1;
 	int ret;
 
-	ret = recovery_get_mmc_part("0#0:HLOS", &desc, &part);
-	if (ret || part.start != 81954 || part.size != 14336)
+	ret = recovery_check_sbe1v1k_prefix(&desc, &has_hlos_1);
+	if (ret)
+		return ret;
+	if (has_hlos_1)
+		return -EINVAL;
+
+	ret = recovery_get_mmc_part_ex(RECOVERY_SBE1V1K_FACTORY_UBOOT_PART,
+					       &desc, &part, true);
+	if (ret || part.start != RECOVERY_SBE1V1K_MAINLINE_UBOOT_START ||
+	    part.size != RECOVERY_SBE1V1K_MAINLINE_UBOOT_SIZE)
 		return ret ?: -EINVAL;
-	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_MAINLINE) {
-		ret = recovery_get_mmc_part("0#0:HLOS_1", &desc, &part);
-		if (ret || part.start != 96290 || part.size != 14336)
+
+	return 0;
+}
+
+static bool recovery_sbe1v1k_hlos_1_missing(void)
+{
+	struct disk_partition part;
+	struct blk_desc *desc;
+
+	return recovery_get_mmc_part_ex("0#0:HLOS_1", &desc, &part, true);
+}
+
+static int recovery_verify_sbe1v1k_gpt(
+	const struct recovery_sbe1v1k_layout_desc *layout,
+	bool require_hlos_1)
+{
+	struct disk_partition part;
+	struct blk_desc *desc;
+	bool has_hlos_1;
+	int ret;
+
+	if (require_hlos_1) {
+		ret = recovery_check_sbe1v1k_prefix(&desc, &has_hlos_1);
+		if (ret || !has_hlos_1)
 			return ret ?: -EINVAL;
+	}
+
+	ret = recovery_get_mmc_part_ex("0#0:HLOS", &desc, &part, true);
+	if (ret || part.start != RECOVERY_SBE1V1K_HLOS_START ||
+	    part.size != RECOVERY_SBE1V1K_HLOS_SIZE)
+		return ret ?: -EINVAL;
+	if (require_hlos_1 ||
+	    layout->id == RECOVERY_SBE1V1K_LAYOUT_MAINLINE ||
+	    layout->id == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+		ret = recovery_get_mmc_part_ex("0#0:HLOS_1", &desc, &part,
+						   true);
+		if (ret || part.start != RECOVERY_SBE1V1K_HLOS_1_START ||
+		    part.size != RECOVERY_SBE1V1K_HLOS_1_SIZE)
+			return ret ?: -EINVAL;
+	}
+	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_MAINLINE ||
+	    layout->id == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
 		ret = part_get_info(desc, 27, &part);
 		if (ret || strcmp((const char *)part.name, "rootfs"))
 			return ret ?: -EINVAL;
 	}
 
-	ret = recovery_get_mmc_part(layout->uboot_part, &desc, &part);
+	ret = recovery_get_mmc_part_ex(layout->uboot_part, &desc, &part,
+					    true);
 	if (ret || part.start != layout->uboot_start ||
 	    part.size != layout->uboot_size)
 		return ret ?: -EINVAL;
 
-	ret = recovery_get_mmc_part(layout->kernel_part, &desc, &part);
+	ret = recovery_get_mmc_part_ex(layout->kernel_part, &desc, &part,
+					    true);
 	if (ret || part.start != layout->kernel_start ||
 	    part.size != layout->kernel_size)
 		return ret ?: -EINVAL;
 
-	ret = recovery_get_mmc_part(layout->rootfs_part, &desc, &part);
+	ret = recovery_get_mmc_part_ex(layout->rootfs_part, &desc, &part,
+					    true);
 	if (ret || part.start != layout->rootfs_start ||
 	    part.size != layout->rootfs_size)
 		return ret ?: -EINVAL;
 
-	ret = recovery_get_mmc_part(layout->data_part, &desc, &part);
+	ret = recovery_get_mmc_part_ex(layout->data_part, &desc, &part,
+					    true);
 	if (ret || part.start != layout->data_start ||
 	    (layout->data_size ? part.size != layout->data_size :
 	     part.size < 1048576))
@@ -3184,17 +4038,56 @@ static int recovery_apply_sbe1v1k_layout(
 		return ret;
 
 	active_sbe1v1k_layout = layout->id;
+	sbe1v1k_factory_pre_migration = false;
 	recovery_debug_printf("SBE1V1K partition profile: %s\n", layout->name);
+	return 0;
+}
+
+static int recovery_apply_sbe1v1k_factory_recovery(void)
+{
+	int ret;
+
+	ret = env_set("recovery_part_uboot",
+		      RECOVERY_SBE1V1K_FACTORY_UBOOT_PART);
+	ret = ret ?: env_set("recovery_part_uboot_alt", NULL);
+	ret = ret ?: env_set("recovery_part_kernel", NULL);
+	ret = ret ?: env_set("recovery_part_rootfs", NULL);
+	ret = ret ?: env_set("recovery_part_data", NULL);
+	ret = ret ?: env_set("recovery_kernel_pad", NULL);
+	if (ret)
+		return ret;
+
+	active_sbe1v1k_layout = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
+	sbe1v1k_factory_pre_migration = true;
+	printf("SBE1V1K factory GPT recognised: chainloader target is rsvd_2; migrate the layout before uploading firmware\n");
 	return 0;
 }
 
 static int recovery_detect_sbe1v1k_layout(void)
 {
-	if (!recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_large))
-		return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_large);
+	sbe1v1k_factory_pre_migration = false;
+	/* Avoid probing a non-existent large-layout chainloader on factory GPTs. */
+	if (recovery_sbe1v1k_hlos_1_missing() &&
+	    !recovery_verify_sbe1v1k_factory_boot_path())
+		return recovery_apply_sbe1v1k_factory_recovery();
 
-	if (!recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_mainline))
+	if (!recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_large, false)) {
+		enum recovery_sbe1v1k_layout persisted_layout;
+
+		if (!recovery_read_sbe1v1k_layout_marker(&persisted_layout) &&
+		    persisted_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
+			return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_qwrt);
+		return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_large);
+	}
+
+	if (!recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_mainline, false)) {
+		enum recovery_sbe1v1k_layout persisted_layout;
+
+		if (!recovery_read_sbe1v1k_layout_marker(&persisted_layout) &&
+		    persisted_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
+			return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_qwrt);
 		return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_mainline);
+	}
 
 	active_sbe1v1k_layout = RECOVERY_SBE1V1K_LAYOUT_UNKNOWN;
 	printf("SBE1V1K partition profile is unknown; layout migration is required\n");
@@ -3301,10 +4194,11 @@ static int recovery_copy_running_chainloader_fit(void **fitp,
 }
 
 static int recovery_read_installed_chainloader_fit(void **fitp,
-						   size_t *fit_sizep)
+					   size_t *fit_sizep)
 {
 	const struct recovery_sbe1v1k_layout_desc *layout =
 		recovery_sbe1v1k_layout_desc(active_sbe1v1k_layout);
+	const char *uboot_part;
 	struct disk_partition part;
 	struct blk_desc *desc;
 	unsigned long long capacity;
@@ -3317,10 +4211,12 @@ static int recovery_read_installed_chainloader_fit(void **fitp,
 	u8 *fit = NULL;
 	int ret;
 
-	if (!layout)
+	uboot_part = layout ? layout->uboot_part :
+		env_get("recovery_part_uboot");
+	if (!uboot_part || !*uboot_part)
 		return -ENOENT;
 
-	ret = recovery_get_mmc_part(layout->uboot_part, &desc, &part);
+	ret = recovery_get_mmc_part(uboot_part, &desc, &part);
 	if (ret)
 		return ret;
 
@@ -3334,7 +4230,7 @@ static int recovery_read_installed_chainloader_fit(void **fitp,
 		return -ENOMEM;
 	if (blk_dread(desc, part.start, 1, header) != 1) {
 		printf("Failed to read chainloader FIT header from '%s'\n",
-		       layout->uboot_part);
+		       uboot_part);
 		ret = -EIO;
 		goto out;
 	}
@@ -3346,7 +4242,7 @@ static int recovery_read_installed_chainloader_fit(void **fitp,
 	fit_size = fit_get_size(header);
 	if (!fit_size || fit_size > max || fit_size > capacity) {
 		printf("Installed chainloader FIT size %lu is invalid for '%s'\n",
-		       (ulong)fit_size, layout->uboot_part);
+		       (ulong)fit_size, uboot_part);
 		ret = -EFBIG;
 		goto out;
 	}
@@ -3360,13 +4256,13 @@ static int recovery_read_installed_chainloader_fit(void **fitp,
 	}
 	if (blk_dread(desc, part.start, blocks, fit) != blocks) {
 		printf("Failed to read chainloader FIT from '%s'\n",
-		       layout->uboot_part);
+		       uboot_part);
 		ret = -EIO;
 		goto out;
 	}
 	if (!recovery_is_sbe1v1k_chainloader_fit(fit, fit_size)) {
 		printf("Installed image in '%s' is not an SBE1V1K chainloader FIT\n",
-		       layout->uboot_part);
+		       uboot_part);
 		ret = -ENOEXEC;
 		goto out;
 	}
@@ -3376,7 +4272,7 @@ static int recovery_read_installed_chainloader_fit(void **fitp,
 	fit = NULL;
 	ret = 0;
 	recovery_debug_printf("Preserved installed SBE1V1K chainloader FIT from '%s' (%lu bytes)\n",
-			      layout->uboot_part, (ulong)fit_size);
+			      uboot_part, (ulong)fit_size);
 
 out:
 	free(fit);
@@ -3597,6 +4493,47 @@ static const char *recovery_env_find_value(const u8 *env_data,
 	return NULL;
 }
 
+static int recovery_read_sbe1v1k_layout_marker(
+	enum recovery_sbe1v1k_layout *layout)
+{
+	const char *value;
+	size_t env_bytes;
+	u8 *env_buf;
+	int ret;
+
+	if (!layout)
+		return -EINVAL;
+
+	ret = recovery_load_appsblenv(&env_buf, &env_bytes, NULL, NULL);
+	if (ret)
+		return ret;
+
+	ret = recovery_verify_appsblenv_crc(env_buf, env_bytes);
+	if (ret)
+		goto out;
+
+	value = recovery_env_find_value(env_buf + RECOVERY_ENV_CRC_SIZE,
+					env_bytes - RECOVERY_ENV_CRC_SIZE,
+					RECOVERY_SBE1V1K_LAYOUT_ENV);
+	if (!value) {
+		ret = -ENOENT;
+		goto out;
+	}
+
+	if (!strcmp(value, "qwrt"))
+		*layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+	else if (!strcmp(value, "large"))
+		*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
+	else if (!strcmp(value, "mainline"))
+		*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
+	else
+		ret = -EINVAL;
+
+out:
+	free(env_buf);
+	return ret;
+}
+
 static int recovery_verify_env_updates(const u8 *env_data, size_t data_size,
 				       const struct recovery_env_update *updates,
 				       size_t update_count)
@@ -3623,6 +4560,69 @@ static int recovery_verify_env_updates(const u8 *env_data, size_t data_size,
 	return 0;
 }
 
+/* Refresh the QWRT identity value before any firmware target is erased. */
+static int recovery_refresh_qwrt_auth_code(void)
+{
+	const struct recovery_env_update update = { "auth_code", NULL };
+	struct recovery_env_update env_update;
+	struct disk_partition part;
+	struct blk_desc *desc;
+	char auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	u8 *env_buf = NULL;
+	size_t env_bytes;
+	u32 crc;
+	int ret;
+
+	if (!recovery_board_is_sbe1v1k() ||
+	    active_sbe1v1k_layout != RECOVERY_SBE1V1K_LAYOUT_QWRT)
+		return 0;
+
+	ret = recovery_qwrt_auth_code(auth_code);
+	if (ret)
+		return ret;
+	env_update = update;
+	env_update.value = auth_code;
+
+	ret = recovery_load_appsblenv(&env_buf, &env_bytes, &desc, &part);
+	if (ret)
+		goto out;
+	ret = recovery_verify_appsblenv_crc(env_buf, env_bytes);
+	if (ret)
+		goto out;
+	ret = recovery_update_env_data(env_buf + RECOVERY_ENV_CRC_SIZE,
+				       env_bytes - RECOVERY_ENV_CRC_SIZE,
+				       &env_update, 1);
+	if (ret)
+		goto out;
+
+	crc = crc32(0, env_buf + RECOVERY_ENV_CRC_SIZE,
+		    env_bytes - RECOVERY_ENV_CRC_SIZE);
+	memcpy(env_buf, &crc, sizeof(crc));
+	if (blk_dwrite(desc, part.start, part.size, env_buf) != part.size) {
+		ret = -EIO;
+		goto out;
+	}
+
+	memset(env_buf, 0, env_bytes);
+	if (blk_dread(desc, part.start, part.size, env_buf) != part.size) {
+		ret = -EIO;
+		goto out;
+	}
+	ret = recovery_verify_appsblenv_crc(env_buf, env_bytes);
+	if (!ret)
+		ret = recovery_verify_env_updates(env_buf + RECOVERY_ENV_CRC_SIZE,
+					  env_bytes - RECOVERY_ENV_CRC_SIZE,
+					  &env_update, 1);
+
+out:
+	recovery_qwrt_secure_zero(auth_code, sizeof(auth_code));
+	if (env_buf) {
+		recovery_qwrt_secure_zero(env_buf, env_bytes);
+		free(env_buf);
+	}
+	return ret;
+}
+
 static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds,
 				    size_t progress_base,
 				    const struct recovery_sbe1v1k_layout_desc *layout)
@@ -3630,13 +4630,15 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 	char bootargs[128];
 	char boot_chainloader[128];
 	char bootcmd[384];
-	const struct recovery_env_update updates[] = {
+	char qwrt_auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	struct recovery_env_update updates[7] = {
 		{ "bootargs", bootargs },
 		{ "boot_chainloader", boot_chainloader },
 		{ "do_boot", "run boot_chainloader" },
 		{ "do_nothing", "true" },
 		{ "bootcmd", bootcmd },
 	};
+	size_t update_count = 5;
 	struct disk_partition part;
 	struct blk_desc *desc;
 	size_t env_bytes;
@@ -3657,6 +4659,20 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 		     "echo \"Hit ctrl+c for shell...\"; if sleep 3; then setenv bootargs %s; run do_boot; else run do_nothing; fi;",
 		     bootargs) >= sizeof(bootcmd))
 		return -ENOSPC;
+	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+		ret = recovery_qwrt_auth_code(qwrt_auth_code);
+		if (ret) {
+			printf("Cannot derive QWRT auth_code from the device serial: %d\n",
+			       ret);
+			return ret;
+		}
+		updates[update_count++] = (struct recovery_env_update){
+			"auth_code", qwrt_auth_code
+		};
+	}
+	updates[update_count++] = (struct recovery_env_update){
+		RECOVERY_SBE1V1K_LAYOUT_ENV, layout->name
+	};
 
 	ret = recovery_load_appsblenv(&env_buf, &env_bytes, &desc, &part);
 	if (ret)
@@ -3668,7 +4684,7 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 
 	ret = recovery_update_env_data(env_buf + RECOVERY_ENV_CRC_SIZE,
 				       env_bytes - RECOVERY_ENV_CRC_SIZE,
-				       updates, ARRAY_SIZE(updates));
+				       updates, update_count);
 	if (ret)
 		goto out;
 
@@ -3695,7 +4711,7 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 
 	ret = recovery_verify_env_updates(env_buf + RECOVERY_ENV_CRC_SIZE,
 					  env_bytes - RECOVERY_ENV_CRC_SIZE,
-					  updates, ARRAY_SIZE(updates));
+					  updates, update_count);
 	if (ret)
 		goto out;
 
@@ -3706,8 +4722,63 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 	recovery_service_runtime(status_leds);
 
 out:
+	recovery_qwrt_secure_zero(qwrt_auth_code, sizeof(qwrt_auth_code));
 	free(env_buf);
 	return ret;
+}
+
+static int recovery_select_sbe1v1k_qwrt_profile(
+	struct recovery_status_led_ctrl *status_leds)
+{
+	char auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	int ret;
+
+	if (recv_off != strlen(RECOVERY_SBE1V1K_REPARTITION_TOKEN) ||
+	    memcmp(recv_base, RECOVERY_SBE1V1K_REPARTITION_TOKEN,
+		   strlen(RECOVERY_SBE1V1K_REPARTITION_TOKEN))) {
+		printf("Invalid QWRT profile confirmation token\n");
+		return -EINVAL;
+	}
+
+	if (!recovery_backend_is_mmc())
+		return -EINVAL;
+
+	/* Fail before touching eMMC when the device identity is unavailable. */
+	ret = recovery_qwrt_auth_code(auth_code);
+	recovery_qwrt_secure_zero(auth_code, sizeof(auth_code));
+	if (ret) {
+		printf("Cannot authorize QWRT profile from the device serial: %d\n",
+		       ret);
+		return ret;
+	}
+
+	if (recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_qwrt, false)) {
+		printf("QWRT profile requires an existing verified factory-compatible GPT\n");
+		return -EINVAL;
+	}
+
+	prog_phase = 2;
+	prog_erase_done = 0;
+	prog_erase_total = 0;
+	prog_write_done = 0;
+	prog_write_total = RECOVERY_APPSBLENV_SIZE;
+	prog_total = prog_write_total;
+	prog_done = 0;
+	recovery_service_runtime(status_leds);
+
+	ret = recovery_write_appsblenv(status_leds, 0, &sbe1v1k_layout_qwrt);
+	if (ret)
+		return ret;
+
+	ret = recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_qwrt);
+	if (ret)
+		return ret;
+
+	prog_write_done = prog_write_total;
+	prog_done = prog_total;
+	recovery_service_runtime(status_leds);
+	recovery_debug_printf("SBE1V1K QWRT profile selected; auth_code refreshed without repartition\n");
+	return 0;
 }
 
 static int recovery_repartition_factory(
@@ -3716,10 +4787,14 @@ static int recovery_repartition_factory(
 {
 	const struct recovery_sbe1v1k_layout_desc *layout =
 		recovery_sbe1v1k_layout_desc(layout_id);
+	char qwrt_auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
 	void *chainloader_fit;
 	size_t chainloader_size;
+	size_t hlos_clone_size;
+	size_t write_progress;
 	char *repartition_gpt;
 	u32 erase_progress_base;
+	bool has_hlos_1;
 	int ret;
 
 	if (!layout) {
@@ -3739,7 +4814,18 @@ static int recovery_repartition_factory(
 		return -EINVAL;
 	}
 
-	ret = recovery_verify_factory_gpt(status_leds);
+	/* Derive QWRT authorization before changing GPT or erasing a target. */
+	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+		ret = recovery_qwrt_auth_code(qwrt_auth_code);
+		recovery_qwrt_secure_zero(qwrt_auth_code, sizeof(qwrt_auth_code));
+		if (ret) {
+			printf("Cannot authorize QWRT layout from the device serial: %d\n",
+			       ret);
+			return ret;
+		}
+	}
+
+	ret = recovery_verify_factory_gpt(status_leds, &has_hlos_1);
 	if (ret)
 		return ret;
 
@@ -3758,10 +4844,22 @@ static int recovery_repartition_factory(
 	erase_progress_base = prog_erase_total;
 	prog_erase_total += RECOVERY_MMC_ERASE_PROGRESS_STEPS;
 	prog_write_done = 0;
-	prog_write_total = 2 + chainloader_size + RECOVERY_APPSBLENV_SIZE;
+	hlos_clone_size = has_hlos_1 ? 0 :
+		RECOVERY_SBE1V1K_HLOS_1_SIZE * 512ULL;
+	prog_write_total = hlos_clone_size + 2 + chainloader_size +
+		RECOVERY_APPSBLENV_SIZE;
 	prog_total = prog_erase_total + prog_write_total;
 	prog_done = prog_erase_done;
 	recovery_service_runtime(status_leds);
+	write_progress = 0;
+
+	if (!has_hlos_1) {
+		ret = recovery_clone_sbe1v1k_hlos_1(status_leds,
+						       write_progress);
+		if (ret)
+			goto out;
+		write_progress += hlos_clone_size;
+	}
 
 	ret = recovery_build_sbe1v1k_gpt(layout, &repartition_gpt);
 	if (ret)
@@ -3771,7 +4869,7 @@ static int recovery_repartition_factory(
 	free(repartition_gpt);
 	if (ret)
 		goto out;
-	prog_write_done = 1;
+	prog_write_done = write_progress + 1;
 	prog_done = prog_erase_done + prog_write_done;
 	recovery_service_runtime(status_leds);
 
@@ -3786,17 +4884,17 @@ static int recovery_repartition_factory(
 	env_set("sbe1v1k_repartition_gpt", NULL);
 	if (ret)
 		goto out;
-	prog_write_done = 2;
+	prog_write_done = write_progress + 2;
 	prog_done = prog_erase_done + prog_write_done;
 	recovery_service_runtime(status_leds);
 
-	ret = recovery_verify_sbe1v1k_gpt(layout);
+	ret = recovery_verify_sbe1v1k_gpt(layout, true);
 	if (ret) {
 		printf("SBE1V1K '%s' GPT verification failed after write: %d\n",
 		       layout->name, ret);
 		goto out;
 	}
-	prog_write_done = 2;
+	prog_write_done = write_progress + 2;
 	prog_done = prog_erase_done + prog_write_done;
 	recovery_service_runtime(status_leds);
 
@@ -3811,12 +4909,14 @@ static int recovery_repartition_factory(
 			      layout->uboot_part);
 	ret = recovery_mmc_write_part(layout->uboot_part,
 					      status_leds, chainloader_fit,
-					      chainloader_size, 2);
+					      chainloader_size,
+					      write_progress + 2);
 	if (ret)
 		goto out;
 
 	recovery_debug_printf("Updating factory U-Boot environment in APPSBLENV...\n");
-	ret = recovery_write_appsblenv(status_leds, 2 + chainloader_size,
+	ret = recovery_write_appsblenv(status_leds,
+					       write_progress + 2 + chainloader_size,
 					       layout);
 	if (ret)
 		goto out;
@@ -3845,6 +4945,10 @@ static int recovery_flash_mmc_firmware(struct recovery_status_led_ctrl *status_l
 	struct recovery_firmware_image image;
 	int ret;
 
+	ret = recovery_require_sbe1v1k_firmware_layout();
+	if (ret)
+		return ret;
+
 	ret = recovery_extract_firmware(recv_base, recv_off, &image);
 	if (ret)
 		return ret;
@@ -3856,6 +4960,12 @@ static int recovery_flash_mmc_firmware(struct recovery_status_led_ctrl *status_l
 		ret = recovery_validate_sbe1v1k_rootfs(&image.rootfs);
 		if (ret)
 			return ret;
+	}
+
+	ret = recovery_refresh_qwrt_auth_code();
+	if (ret) {
+		printf("Cannot refresh QWRT auth_code before erase: %d\n", ret);
+		return ret;
 	}
 
 	ret = recovery_mmc_check_part_size(kernel_part, image.kernel.size);
@@ -4100,6 +5210,12 @@ static int recovery_resolve_target(enum upload_target tgt,
 	ulong ofs;
 
 	memset(target, 0, sizeof(*target));
+	if (tgt == TARGET_FIRMWARE) {
+		int ret = recovery_require_sbe1v1k_firmware_layout();
+
+		if (ret)
+			return ret;
+	}
 
 	if (!name)
 		name = recovery_default_target(tgt);
@@ -4884,6 +6000,13 @@ static int recovery_validate_upload_length(enum upload_target target,
 	loff_t target_ofs = 0;
 	unsigned long target_max;
 	unsigned long max;
+	int ret;
+
+	if (target == TARGET_FIRMWARE) {
+		ret = recovery_require_sbe1v1k_firmware_layout();
+		if (ret)
+			return ret;
+	}
 
 	target_max = recovery_calc_target_max(target, force_recreate,
 					      &target_ofs);
@@ -5050,6 +6173,237 @@ static int recovery_backup_source_from_boot(struct blk_desc *desc,
 	snprintf(source->name, sizeof(source->name), "eMMC boot%d", boot_index);
 	snprintf(source->filename, sizeof(source->filename), "emmc-boot%d.img",
 		 boot_index);
+	return 0;
+}
+
+static int recovery_restore_source_from_id(
+	struct blk_desc *desc, const char *id,
+	struct recovery_backup_source *source)
+{
+	static const char prefix[] = "partition-";
+	unsigned int number = 0;
+	const char *p;
+	int ret;
+
+	if (!strcmp(id, "boot0") || !strcmp(id, "boot1")) {
+		ret = recovery_backup_source_from_boot(desc, id[4] - '0', source);
+		if (blk_dselect_hwpart(desc, EMMC_HWPART_DEFAULT) && !ret)
+			ret = -EIO;
+		return ret;
+	}
+
+	if (strncmp(id, prefix, strlen(prefix)))
+		return -EINVAL;
+	p = id + strlen(prefix);
+	if (*p < '0' || *p > '9')
+		return -EINVAL;
+	while (*p >= '0' && *p <= '9') {
+		number = number * 10 + (*p++ - '0');
+		if (number > MAX_SEARCH_PARTITIONS)
+			return -EINVAL;
+	}
+	if (*p || !number)
+		return -EINVAL;
+
+	ret = blk_dselect_hwpart(desc, EMMC_HWPART_DEFAULT);
+	if (ret)
+		return ret;
+	return recovery_backup_source_from_partition(desc, number, source);
+}
+
+static void recovery_restore_reset(void)
+{
+	if (recovery_restore.desc)
+		blk_dselect_hwpart(recovery_restore.desc, EMMC_HWPART_DEFAULT);
+	free(recovery_restore.buf);
+	memset(&recovery_restore, 0, sizeof(recovery_restore));
+}
+
+static int recovery_restore_prepare_partition(
+	const char *id, unsigned long long total,
+	struct recovery_status_led_ctrl *status_leds)
+{
+	struct recovery_backup_source source;
+	struct disk_partition part;
+	struct blk_desc *desc;
+	size_t buf_size;
+	int restore_ret;
+	int ret;
+
+	recovery_restore_reset();
+	ret = blk_get_device_by_str("mmc", recovery_mmcdev(), &desc);
+	if (ret < 0)
+		return ret;
+
+	ret = recovery_restore_source_from_id(desc, id, &source);
+	if (ret)
+		return ret;
+	if (!total || total != source.bytes) {
+		printf("Partition restore size %llu does not match target '%s' size %llu\n",
+		       total, id, source.bytes);
+		return -EFBIG;
+	}
+	if (!source.blksz || source.blocks > UINT_MAX)
+		return -EOVERFLOW;
+
+	buf_size = source.bytes < RECOVERY_MMC_RESTORE_CHUNK ?
+		(size_t)source.bytes : RECOVERY_MMC_RESTORE_CHUNK;
+	buf_size -= buf_size % source.blksz;
+	if (!buf_size)
+		return -EOVERFLOW;
+
+	recovery_restore.buf = memalign(ARCH_DMA_MINALIGN, buf_size);
+	if (!recovery_restore.buf)
+		return -ENOMEM;
+	recovery_restore.buf_size = buf_size;
+	recovery_restore.desc = desc;
+	recovery_restore.source = source;
+	recovery_restore.total = total;
+	strlcpy(recovery_restore.id, id, sizeof(recovery_restore.id));
+
+	memset(&part, 0, sizeof(part));
+	part.start = source.start;
+	part.size = source.blocks;
+	part.blksz = source.blksz;
+	strlcpy((char *)part.name, source.name, sizeof(part.name));
+
+	prog_phase = 1;
+	prog_done = 0;
+	prog_erase_done = 0;
+	prog_erase_total = RECOVERY_MMC_ERASE_PROGRESS_STEPS;
+	prog_write_done = 0;
+	prog_write_total = source.blocks;
+	prog_total = prog_erase_total + prog_write_total;
+	prog_reboot = 0;
+
+	ret = blk_dselect_hwpart(desc, source.hwpart);
+	if (!ret)
+		ret = recovery_mmc_erase_resolved(id, status_leds, desc, &part, 0);
+	restore_ret = blk_dselect_hwpart(desc, EMMC_HWPART_DEFAULT);
+	if (!ret && restore_ret)
+		ret = restore_ret;
+	if (ret) {
+		prog_phase = -1;
+		recovery_restore_reset();
+		return ret;
+	}
+
+	recovery_restore.active = true;
+	recovery_restore.prepared = true;
+	prog_phase = 4;
+	prog_erase_done = prog_erase_total;
+	prog_done = prog_erase_done;
+	recovery_debug_printf("Partition restore target '%s' erased; waiting for %llu bytes\n",
+			      id, total);
+	return 0;
+}
+
+static int recovery_restore_flush(void)
+{
+	struct recovery_backup_source *source = &recovery_restore.source;
+	lbaint_t blk, blocks;
+	int restore_ret;
+	int ret = 0;
+
+	if (!recovery_restore.active || !recovery_restore.receiving)
+		return -EINVAL;
+	if (!recovery_restore.buf_used)
+		return 0;
+	if (recovery_restore.buf_used % source->blksz ||
+	    recovery_restore.written % source->blksz)
+		return -EINVAL;
+
+	blk = source->start + recovery_restore.written / source->blksz;
+	blocks = recovery_restore.buf_used / source->blksz;
+	if (blocks > source->blocks - recovery_restore.written / source->blksz)
+		return -EFBIG;
+
+	ret = blk_dselect_hwpart(recovery_restore.desc, source->hwpart);
+	if (!ret && blk_dwrite(recovery_restore.desc, blk, blocks,
+			       recovery_restore.buf) != blocks)
+		ret = -EIO;
+	restore_ret = blk_dselect_hwpart(recovery_restore.desc,
+					 EMMC_HWPART_DEFAULT);
+	if (!ret && restore_ret)
+		ret = restore_ret;
+	if (ret) {
+		printf("Partition restore write failed for '%s' at block " LBAF
+		       " count " LBAF "\n", recovery_restore.id, blk, blocks);
+		return ret;
+	}
+
+	recovery_restore.written += recovery_restore.buf_used;
+	recovery_restore.buf_used = 0;
+	prog_write_done = recovery_restore.written / source->blksz;
+	prog_done = prog_erase_done + prog_write_done;
+	if (recovery_runtime_status_leds)
+		recovery_status_led_poll(recovery_runtime_status_leds);
+	recovery_watchdog_poll();
+	return 0;
+}
+
+static int recovery_restore_append(const void *data, size_t size)
+{
+	const u8 *src = data;
+
+	if (!recovery_restore.active || !recovery_restore.receiving ||
+	    recovery_restore.chunk_received > recv_total ||
+	    size > recv_total - recovery_restore.chunk_received)
+		return -EFBIG;
+
+	while (size) {
+		size_t space = recovery_restore.buf_size - recovery_restore.buf_used;
+		size_t copy = min(size, space);
+		int ret;
+
+		memcpy(recovery_restore.buf + recovery_restore.buf_used, src, copy);
+		recovery_restore.buf_used += copy;
+		recovery_restore.chunk_received += copy;
+		src += copy;
+		size -= copy;
+		if (recovery_restore.buf_used == recovery_restore.buf_size) {
+			ret = recovery_restore_flush();
+			if (ret)
+				return ret;
+		}
+	}
+
+	return 0;
+}
+
+static int recovery_restore_finish_chunk(void)
+{
+	unsigned long long expected_end;
+	int ret;
+
+	if (!recovery_restore.active || !recovery_restore.receiving ||
+	    recovery_restore.chunk_received != recv_total)
+		return -EIO;
+
+	ret = recovery_restore_flush();
+	if (ret)
+		return ret;
+	expected_end = recovery_restore.chunk_offset + recv_total;
+	if (recovery_restore.written != expected_end ||
+	    recovery_restore.written > recovery_restore.total)
+		return -EIO;
+
+	recovery_restore.receiving = false;
+	if (recovery_restore.written == recovery_restore.total) {
+		recovery_restore.active = false;
+		recovery_restore.prepared = false;
+		free(recovery_restore.buf);
+		recovery_restore.buf = NULL;
+		prog_write_done = prog_write_total;
+		prog_done = prog_total;
+		prog_phase = 3;
+		recovery_debug_printf("Partition restore '%s' complete (%llu bytes)\n",
+				      recovery_restore.id, recovery_restore.total);
+	} else {
+		recovery_restore.prepared = true;
+		prog_phase = 4;
+	}
+
 	return 0;
 }
 
@@ -5302,7 +6656,8 @@ static int recovery_open_partitions(struct fs_file *file)
 		return recovery_http_error(file, "409 Conflict",
 					   "A backup stream is already active.\n");
 	if ((prog_phase > 0 && prog_phase < 3) || recovery_stream.active ||
-	    flash_request || prog_reboot || reboot_request)
+	    recovery_restore.receiving || restore_prepare_request || flash_request ||
+	    prog_reboot || reboot_request)
 		return recovery_http_error(file, "409 Conflict",
 					   "A destructive storage operation is active.\n");
 
@@ -5420,7 +6775,8 @@ static int recovery_open_backup(struct fs_file *file, const char *path)
 		return recovery_http_error(file, "409 Conflict",
 					   "A backup stream is already active.\n");
 	if ((prog_phase > 0 && prog_phase < 3) || recovery_stream.active ||
-	    flash_request || prog_reboot || reboot_request)
+	    recovery_restore.active || restore_prepare_request || flash_request ||
+	    prog_reboot || reboot_request)
 		return recovery_http_error(file, "409 Conflict",
 					   "A destructive storage operation is active.\n");
 
@@ -5591,7 +6947,8 @@ static int recovery_open_status(struct fs_file *file)
 			    (unsigned int)prog_erase_total,
 			    (unsigned int)prog_write_done,
 			    (unsigned int)prog_write_total,
-			    recovery_stream.active && recovery_stream.prepared,
+			    (recovery_stream.active && recovery_stream.prepared) ||
+			    (recovery_restore.active && recovery_restore.prepared),
 			    prog_phase == 3, prog_phase == -1, prog_phase,
 			    prog_reboot);
 	if (json_len < 0)
@@ -5606,39 +6963,72 @@ static int recovery_open_about(struct fs_file *file)
 {
 	const struct recovery_sbe1v1k_layout_desc *layout =
 		recovery_sbe1v1k_layout_desc(active_sbe1v1k_layout);
-	static char page[640];
+	static char page[896];
 	unsigned long long firmware_max;
 	unsigned long env_max;
 	const char *layout_name;
-	char json[512];
+	const char *rootarg;
+	const char *uboot_part;
+	ulong kernel_pad;
+	bool firmware_locked;
+	bool qwrt_unlocked;
+	char json[768];
 	int json_len;
+	qwrt_unlocked = recovery_board_is_sbe1v1k() && qwrt_button_unlocked;
 
-	layout_name = layout ? layout->name : "unknown";
-	if (!layout)
-		layout = &sbe1v1k_layout_large;
-	firmware_max = (unsigned long long)(layout->kernel_size +
-						 layout->rootfs_size) * 512;
-	env_max = env_get_hex("recovery_max", 0);
-	if (env_max && firmware_max > env_max)
-		firmware_max = env_max;
+	if (!layout && recovery_board_is_sbe1v1k()) {
+		layout_name = sbe1v1k_factory_pre_migration ? "factory" :
+			"unknown";
+		firmware_max = 0;
+		kernel_pad = 0;
+		rootarg = "";
+		uboot_part = env_get("recovery_part_uboot") ?: "";
+	} else {
+		if (!layout)
+			layout = &sbe1v1k_layout_large;
+		layout_name = layout->name;
+		firmware_max = (unsigned long long)(layout->kernel_size +
+								 layout->rootfs_size) * 512;
+		/* Keep the one-shot QWRT profile undiscoverable until the button unlock. */
+		if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
+		    !qwrt_unlocked)
+			layout_name = "mainline";
+		env_max = env_get_hex("recovery_max", 0);
+		if (env_max && firmware_max > env_max)
+			firmware_max = env_max;
+		kernel_pad = layout->kernel_pad;
+		rootarg = layout->rootarg;
+		uboot_part = layout->uboot_part;
+	}
+	firmware_locked = recovery_board_is_sbe1v1k() &&
+		(active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_UNKNOWN ||
+		 (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
+		  !qwrt_unlocked));
 
 #ifdef U_BOOT_DATE
 	json_len = snprintf(json, sizeof(json),
 			    "{\"u_boot\":\"%s (%s - %s %s)\","
 			    "\"layout\":\"%s\",\"kernel_pad\":%lu,"
 			    "\"firmware_max\":%llu,\"rootarg\":\"%s\","
-			    "\"uboot_part\":\"%s\"}\n",
-			    U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME,
-			    U_BOOT_TZ, layout_name, (ulong)layout->kernel_pad,
-			    firmware_max, layout->rootarg, layout->uboot_part);
+				    "\"uboot_part\":\"%s\",\"firmware_locked\":%d,"
+				    "\"qwrt_available\":%d,\"qwrt_unlocked\":%d,"
+				    "\"qwrt_button_presses\":%u}\n",
+				    U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME,
+				    U_BOOT_TZ, layout_name, kernel_pad,
+				    firmware_max, rootarg, uboot_part, firmware_locked,
+				    qwrt_button_available, qwrt_unlocked,
+				    qwrt_button_presses);
 #else
 	json_len = snprintf(json, sizeof(json),
 			    "{\"u_boot\":\"%s\",\"layout\":\"%s\","
 			    "\"kernel_pad\":%lu,\"firmware_max\":%llu,"
-			    "\"rootarg\":\"%s\",\"uboot_part\":\"%s\"}\n",
-			    U_BOOT_VERSION, layout_name,
-			    (ulong)layout->kernel_pad, firmware_max,
-			    layout->rootarg, layout->uboot_part);
+			    "\"rootarg\":\"%s\",\"uboot_part\":\"%s\","
+				    "\"firmware_locked\":%d,\"qwrt_available\":%d,"
+				    "\"qwrt_unlocked\":%d,\"qwrt_button_presses\":%u}\n",
+				    U_BOOT_VERSION, layout_name,
+				    kernel_pad, firmware_max, rootarg, uboot_part,
+				    firmware_locked, qwrt_button_available, qwrt_unlocked,
+				    qwrt_button_presses);
 #endif
 	if (json_len < 0)
 		return 0;
@@ -5967,8 +7357,136 @@ static int recovery_layout_from_uri(const char *uri,
 		*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
 		return 0;
 	}
+	if (!strncmp(value, "qwrt", 4) &&
+	    (value[4] == '\0' || value[4] == '&')) {
+		*layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+		return 0;
+	}
 
 	return -EINVAL;
+}
+
+static int recovery_parse_decimal_ull(const char *value,
+				      unsigned long long *result)
+{
+	unsigned long long parsed = 0;
+
+	if (!value || !*value || !result)
+		return -EINVAL;
+	while (*value) {
+		unsigned int digit;
+
+		if (*value < '0' || *value > '9')
+			return -EINVAL;
+		digit = *value++ - '0';
+		if (parsed > (~0ULL - digit) / 10)
+			return -EOVERFLOW;
+		parsed = parsed * 10 + digit;
+	}
+
+	*result = parsed;
+	return 0;
+}
+
+static bool recovery_restore_id_valid(const char *id)
+{
+	static const char prefix[] = "partition-";
+	const char *p;
+	unsigned int number = 0;
+
+	if (!id)
+		return false;
+	if (!strcmp(id, "boot0") || !strcmp(id, "boot1"))
+		return true;
+	if (strncmp(id, prefix, strlen(prefix)))
+		return false;
+
+	p = id + strlen(prefix);
+	if (*p < '0' || *p > '9')
+		return false;
+	while (*p >= '0' && *p <= '9') {
+		number = number * 10 + (*p++ - '0');
+		if (number > MAX_SEARCH_PARTITIONS)
+			return false;
+	}
+
+	return !*p && number;
+}
+
+static int recovery_restore_request_from_uri(
+	const char *uri, const char *path, bool chunk, char *id, size_t id_size,
+	unsigned long long *offset, unsigned long long *total)
+{
+	const char *query;
+	bool have_id = false;
+	bool have_offset = false;
+	bool have_total = false;
+
+	if (strncmp(uri, path, strlen(path)) || uri[strlen(path)] != '?')
+		return -EINVAL;
+	query = uri + strlen(path) + 1;
+	if (!*query)
+		return -EINVAL;
+
+	while (*query) {
+		const char *end = strchr(query, '&');
+		const char *equals;
+		size_t item_len = end ? (size_t)(end - query) : strlen(query);
+		size_t key_len;
+		size_t value_len;
+		char number[32];
+		int ret;
+
+		if (!item_len)
+			return -EINVAL;
+		equals = memchr(query, '=', item_len);
+		if (!equals || equals == query)
+			return -EINVAL;
+		key_len = equals - query;
+		value_len = item_len - key_len - 1;
+		if (!value_len)
+			return -EINVAL;
+
+		if (key_len == 2 && !memcmp(query, "id", 2)) {
+			if (have_id || value_len >= id_size)
+				return -EINVAL;
+			memcpy(id, equals + 1, value_len);
+			id[value_len] = '\0';
+			if (!recovery_restore_id_valid(id))
+				return -EINVAL;
+			have_id = true;
+		} else if (chunk && key_len == 6 &&
+			   !memcmp(query, "offset", 6)) {
+			if (have_offset || value_len >= sizeof(number))
+				return -EINVAL;
+			memcpy(number, equals + 1, value_len);
+			number[value_len] = '\0';
+			ret = recovery_parse_decimal_ull(number, offset);
+			if (ret)
+				return ret;
+			have_offset = true;
+		} else if (((chunk && key_len == 5 &&
+			     !memcmp(query, "total", 5)) ||
+			    (!chunk && key_len == 4 &&
+			     !memcmp(query, "size", 4)))) {
+			if (have_total || value_len >= sizeof(number))
+				return -EINVAL;
+			memcpy(number, equals + 1, value_len);
+			number[value_len] = '\0';
+			ret = recovery_parse_decimal_ull(number, total);
+			if (ret)
+				return ret;
+			have_total = true;
+		} else {
+			return -EINVAL;
+		}
+
+		if (!end)
+			break;
+		query = end + 1;
+	}
+
+	return have_id && have_total && (!chunk || have_offset) ? 0 : -EINVAL;
 }
 
 err_t httpd_post_begin(void *connection, const char *uri, const char *http_request,
@@ -5980,7 +7498,6 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 
 	(void)http_request;
 	(void)http_request_len;
-	(void)connection;
 	/*
 	 * Throttle large uploads explicitly: recovery accepts firmware images
 	 * that are much larger than a typical lwIP POST body and manual window
@@ -5988,15 +7505,55 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	 */
 	if (post_auto_wnd)
 		*post_auto_wnd = 0;
+	if (post_connection) {
+		printf("httpd: rejecting concurrent POST connection\n");
+		strlcpy(response_uri, "/fail.html", response_uri_len);
+		return ERR_USE;
+	}
 	post_ok = 0;
+	current_restore_prepare = false;
+	current_restore_chunk = false;
+	current_restore_id[0] = '\0';
+	current_restore_size = 0;
+	current_restore_offset = 0;
+
+	if (!strncmp(uri, "/action/prepare/restore", 23) &&
+	    (uri[23] == '\0' || uri[23] == '?')) {
+		current_restore_prepare = true;
+		if (recovery_restore_request_from_uri(
+			    uri, "/action/prepare/restore", false,
+			    current_restore_id, sizeof(current_restore_id), NULL,
+			    &current_restore_size)) {
+			prog_phase = -1;
+			printf("httpd: invalid partition restore prepare request\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_ARG;
+		}
+	} else if (!strncmp(uri, "/upload/restore", 15) &&
+		   (uri[15] == '\0' || uri[15] == '?')) {
+		current_restore_chunk = true;
+		if (recovery_restore_request_from_uri(
+			    uri, "/upload/restore", true, current_restore_id,
+			    sizeof(current_restore_id), &current_restore_offset,
+			    &current_restore_size)) {
+			prog_phase = -1;
+			printf("httpd: invalid partition restore upload request\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_ARG;
+		}
+	}
 	if (recovery_backup_active) {
 		printf("httpd: rejecting destructive operation while %u backup stream(s) are active\n",
 		       recovery_backup_active);
 		strlcpy(response_uri, "/fail.html", response_uri_len);
 		return ERR_USE;
 	}
-	if (prepare_request || (prog_phase > 0 && prog_phase < 3) ||
-	    prog_reboot || reboot_request) {
+	if (prepare_request || restore_prepare_request || flash_request ||
+	    (prog_phase > 0 && prog_phase < 3) || prog_reboot || reboot_request ||
+	    (recovery_restore.active && !current_restore_chunk &&
+	     !current_restore_prepare) ||
+	    (recovery_stream.active &&
+	     (current_restore_prepare || current_restore_chunk))) {
 		printf("httpd: rejecting concurrent destructive operation\n");
 		strlcpy(response_uri, "/fail.html", response_uri_len);
 		return ERR_USE;
@@ -6007,6 +7564,60 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 	recv_total = 0;
 	current_force_recreate = false;
 	current_prepare_only = false;
+
+	if (current_restore_prepare) {
+		if (!recovery_backend_is_mmc() || content_len <= 0 ||
+		    content_len > RECOVERY_RESTORE_BODY_MAX ||
+		    !current_restore_size) {
+			prog_phase = -1;
+			printf("httpd: invalid partition restore confirmation\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_ARG;
+		}
+		recv_total = content_len;
+		recv_base = current_restore_body;
+		memset(current_restore_body, 0, sizeof(current_restore_body));
+		post_connection = connection;
+		post_ok = 1;
+		return ERR_OK;
+	}
+
+	if (current_restore_chunk) {
+		unsigned long long remaining;
+		ulong blksz;
+
+		if (!recovery_backend_is_mmc() || !recovery_restore.active ||
+		    !recovery_restore.prepared || recovery_restore.receiving ||
+		    strcmp(current_restore_id, recovery_restore.id) ||
+		    current_restore_size != recovery_restore.total ||
+		    current_restore_offset != recovery_restore.written ||
+		    content_len <= 0 || content_len > RECOVERY_MMC_RESTORE_CHUNK) {
+			printf("httpd: partition restore chunk does not match the prepared session\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_USE;
+		}
+
+		blksz = recovery_restore.source.blksz;
+		remaining = recovery_restore.total - recovery_restore.written;
+		if (!blksz || current_restore_offset % blksz ||
+		    (ulong)content_len % blksz ||
+		    (unsigned long long)content_len > remaining) {
+			printf("httpd: unaligned or oversized partition restore chunk\n");
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return ERR_ARG;
+		}
+
+		recv_total = content_len;
+		recovery_restore.chunk_offset = current_restore_offset;
+		recovery_restore.chunk_received = 0;
+		recovery_restore.buf_used = 0;
+		recovery_restore.prepared = false;
+		recovery_restore.receiving = true;
+		prog_phase = 2;
+		post_connection = connection;
+		post_ok = 1;
+		return ERR_OK;
+	}
 
 	/* Accept optional query parameters after the target path. */
 	if (!strncmp(uri, "/action/prepare/firmware", 24) &&
@@ -6046,6 +7657,13 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		printf("httpd: invalid SBE1V1K partition profile\n");
 		strlcpy(response_uri, "/fail.html", response_uri_len);
 		return ERR_ARG;
+	}
+	if (current_target == TARGET_REPARTITION &&
+	    current_repartition_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
+	    !qwrt_button_unlocked) {
+		printf("httpd: QWRT profile is unavailable in this recovery session\n");
+		strlcpy(response_uri, "/fail.html", response_uri_len);
+		return ERR_USE;
 	}
 	if (current_target == TARGET_UBOOT &&
 	    current_stream_format != RECOVERY_STREAM_RAW) {
@@ -6119,6 +7737,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		tname = current_target == TARGET_FIRMWARE ? "firmware" : "uboot";
 		recovery_debug_printf("httpd: accepting prepared destructive stream of %u bytes for %s\n",
 				      recv_total, tname);
+		post_connection = connection;
 		return ERR_OK;
 	}
 
@@ -6178,6 +7797,7 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
 		recovery_debug_printf("httpd: accepting upload of %u bytes for %s to 0x%08lx%s\n",
 				      recv_total, tname, (ulong)recv_base,
 				      current_force_recreate ? " (force recreate)" : "");
+	post_connection = connection;
 	return ERR_OK;
 }
 
@@ -6198,7 +7818,15 @@ err_t httpd_post_receive_data(void *connection, struct pbuf *p)
 
 		if (clen > avail)
 			clen = avail;
-		if (recovery_stream.active) {
+		if (current_restore_chunk) {
+			if (recovery_restore_append(q->payload, clen)) {
+				post_ok = 0;
+				prog_phase = -1;
+				recovery_restore_reset();
+				pbuf_free(p);
+				return ERR_IF;
+			}
+		} else if (recovery_stream.active) {
 			if (recovery_mmc_stream_append(q->payload, clen)) {
 				post_ok = 0;
 				prog_phase = -1;
@@ -6231,7 +7859,53 @@ void httpd_post_finished(void *connection, char *response_uri, u16_t response_ur
 	unsigned long requested_size;
 	int ret;
 
-	(void)connection;
+	if (connection != post_connection) {
+		strlcpy(response_uri, "/fail.html", response_uri_len);
+		return;
+	}
+	post_connection = NULL;
+	if (current_restore_prepare) {
+		char expected[RECOVERY_RESTORE_BODY_MAX + 1];
+		int expected_len;
+
+		expected_len = snprintf(expected, sizeof(expected), "%s:%s",
+					RECOVERY_SBE1V1K_RESTORE_TOKEN,
+					current_restore_id);
+		if (!post_ok || !recv_total || recv_off != recv_total ||
+		    expected_len < 0 || expected_len >= sizeof(expected) ||
+		    recv_total != expected_len ||
+		    memcmp(current_restore_body, expected, expected_len)) {
+			post_ok = 0;
+			prog_phase = -1;
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+			return;
+		}
+
+		restore_prepare_request = -1;
+		strlcpy(restore_prepare_id, current_restore_id,
+			sizeof(restore_prepare_id));
+		restore_prepare_size = current_restore_size;
+		prog_phase = 0;
+		prog_reboot = 0;
+		strlcpy(response_uri, "/ok", response_uri_len);
+		sys_timeout(RECOVERY_PREPARE_START_DELAY_MS,
+			    restore_prepare_delay_cb, NULL);
+		return;
+	}
+
+	if (current_restore_chunk) {
+		if (!post_ok || !recv_total || recv_off != recv_total ||
+		    recovery_restore_finish_chunk()) {
+			post_ok = 0;
+			prog_phase = -1;
+			recovery_restore_reset();
+			strlcpy(response_uri, "/fail.html", response_uri_len);
+		} else {
+			strlcpy(response_uri, "/ok", response_uri_len);
+		}
+		return;
+	}
+
 	if (current_prepare_only) {
 		if (!post_ok || !recv_total || recv_off != recv_total) {
 			post_ok = 0;
@@ -6318,16 +7992,21 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 
 	if (current_target == TARGET_REPARTITION) {
 		prog_reboot = 0;
-		ret = recovery_repartition_factory(status_leds,
-						   current_repartition_layout);
+		if (current_repartition_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
+		    (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_MAINLINE ||
+		     active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT))
+			ret = recovery_select_sbe1v1k_qwrt_profile(status_leds);
+		else
+			ret = recovery_repartition_factory(status_leds,
+							   current_repartition_layout);
 		if (ret) {
-			printf("Factory repartition failed: %d\n", ret);
+			printf("SBE1V1K profile operation failed: %d\n", ret);
 			prog_phase = -1;
 			return ret;
 		}
 
 		prog_phase = 3;
-		recovery_debug_printf("Factory repartition complete.\n");
+		recovery_debug_printf("SBE1V1K profile operation complete.\n");
 		return 0;
 	}
 
@@ -6546,18 +8225,29 @@ int run_http_recovery(void)
 
 	recv_off = recv_total = 0;
 	recovery_mmc_stream_reset();
+	recovery_restore_reset();
 	recovery_stream_completed = false;
 	recovery_runtime_status_leds = &status_leds;
 	post_ok = 0;
+	post_connection = NULL;
 	upload_done = 0;
 	flash_request = 0;
 	prepare_request = 0;
+	restore_prepare_request = 0;
+	restore_prepare_id[0] = '\0';
+	restore_prepare_size = 0;
 	prepare_size = 0;
 	current_prepare_only = false;
+	current_restore_prepare = false;
+	current_restore_chunk = false;
+	current_restore_id[0] = '\0';
+	current_restore_size = 0;
+	current_restore_offset = 0;
 	reboot_request = 0;
 	memset(&leds, 0, sizeof(leds));
 	memset(&status_leds, 0, sizeof(status_leds));
 	memset(&dhcp, 0, sizeof(dhcp));
+	recovery_qwrt_button_init();
 	if (recovery_board_is_sbe1v1k() && recovery_backend_is_mmc())
 		recovery_detect_sbe1v1k_layout();
 
@@ -6627,6 +8317,7 @@ int run_http_recovery(void)
 		}
 		/* net_lwip_rx() already runs sys_check_timeouts(). */
 		net_lwip_rx(udev, netif);
+		recovery_qwrt_button_poll();
 		if (use_status_leds)
 			recovery_status_led_poll(&status_leds);
 		else if (use_link_leds)
@@ -6644,6 +8335,22 @@ int run_http_recovery(void)
 				       rc);
 			} else {
 				recovery_debug_printf("Target erase complete; waiting for image stream.\n");
+			}
+		}
+		if (restore_prepare_request > 0) {
+			char restore_id[RECOVERY_RESTORE_ID_MAX];
+			unsigned long long restore_size = restore_prepare_size;
+
+			strlcpy(restore_id, restore_prepare_id, sizeof(restore_id));
+			restore_prepare_request = 0;
+			restore_prepare_id[0] = '\0';
+			restore_prepare_size = 0;
+			rc = recovery_restore_prepare_partition(restore_id, restore_size,
+							 &status_leds);
+			if (rc) {
+				prog_phase = -1;
+				printf("Partition restore preparation failed: %d\n",
+				       rc);
 			}
 		}
 		if (flash_request) {
@@ -6678,8 +8385,13 @@ int run_http_recovery(void)
 	rc = 0;
 
 out:
+	qwrt_button_unlocked = false;
+	qwrt_button_available = false;
+	qwrt_button = NULL;
+	recovery_qwrt_button_reset();
 	recovery_runtime_status_leds = NULL;
 	recovery_mmc_stream_reset();
+	recovery_restore_reset();
 	recovery_dhcp_server_stop(&dhcp);
 	net_lwip_set_recovery_dhcp_hook(NULL, NULL);
 	if (netif)
