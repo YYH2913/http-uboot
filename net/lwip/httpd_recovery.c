@@ -8459,7 +8459,22 @@ int run_http_recovery(void)
 	eth_started = true;
 	recovery_watchdog_poll();
 
+	/*
+	 * A previous boot stage can leave the Ethernet device enumerated but
+	 * without a current-device pointer (or in the passive state).  The
+	 * normal eth_init() path usually repairs this, but the stock bootm /
+	 * chainloader handoff does not guarantee it.  Resolve the default device
+	 * and start it once more before rejecting recovery networking.
+	 */
 	udev = eth_get_current();
+	if (!udev)
+		udev = eth_get_dev();
+	if (udev && !eth_is_active(udev)) {
+		rc = eth_start_udev(udev);
+		if (rc < 0)
+			recovery_debug_printf("HTTP recovery: unable to restart Ethernet (%d)\n",
+					      rc);
+	}
 	if (!udev || !eth_is_active(udev)) {
 		printf("No active net device\n");
 		rc = -ENODEV;
