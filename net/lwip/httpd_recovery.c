@@ -8595,7 +8595,7 @@ out:
 	if (netif)
 		net_lwip_remove_netif(netif);
 	if (eth_started)
-		eth_halt();
+		net_lwip_eth_stop();
 	recovery_status_led_stop(&status_leds);
 	recovery_status_led_release(&status_leds);
 	recovery_led_ctrl_free(&leds);
