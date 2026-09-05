@@ -9,8 +9,13 @@
 #include <env.h>
 #include <fdt_support.h>
 #include <linux/err.h>
+#include <log.h>
 #include <malloc.h>
 #include <smem.h>
+
+#if IS_ENABLED(CONFIG_HTTPD_RECOVERY)
+extern int recovery_sbe1v1k_prepare_auth(void);
+#endif
 
 #define SBE1V1K_APSS_WDT_BASE		0x0b017000
 #define SBE1V1K_APSS_WDT_RST		0x04
@@ -255,6 +260,17 @@ int board_early_init_f(void)
 	sbe1v1k_disable_watchdog();
 
 	return 0;
+}
+
+void qcom_late_init(void)
+{
+#if IS_ENABLED(CONFIG_HTTPD_RECOVERY)
+	int ret;
+
+	ret = recovery_sbe1v1k_prepare_auth();
+	if (ret)
+		log_debug("SBE1V1K auth_code preparation skipped: %d\n", ret);
+#endif
 }
 
 void qcom_board_init(void)

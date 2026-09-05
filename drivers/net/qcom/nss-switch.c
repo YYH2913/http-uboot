@@ -1725,6 +1725,32 @@ static void ipq_vsi_setup(phys_addr_t reg_base, u32 vsi,
 	writel(0x9, reg_base + 0x063804 + (vsi * 0x10));
 }
 
+static u32 ipq_ppe_bridge_member_mask(const struct ppe_info *info)
+{
+	u32 mask;
+
+	mask = info->bridge_port_mask ? info->bridge_port_mask : info->vsi;
+
+	/* The CPU port must remain reachable from the recovery bridge. */
+	mask |= BIT(0);
+	mask &= BIT(info->no_ports + 1) - 1;
+
+	return mask;
+}
+
+static u32 ipq_ppe_bridge_isolation_value(const struct ppe_info *info,
+						  unsigned int port)
+{
+	u32 member_mask = ipq_ppe_bridge_member_mask(info);
+	u32 allowed = member_mask;
+
+	/* A port outside the recovery bridge must not reach the CPU or LAN. */
+	if (!(member_mask & BIT(port)))
+		allowed = BIT(port);
+
+	return (allowed << 8) & ppe_port_bridge_isolation_mask(info->nos_iports);
+}
+
 void ipq_ppe_tdm_configuration(struct ppe_info *ppe)
 {
 	u32 i;
@@ -1931,9 +1957,12 @@ void ipq_port_mac_clock_reset(struct udevice *dev, struct port_info *port)
 void ipq_ppe_provision_init(struct ppe_info *info)
 {
 	phys_addr_t reg_base = info->base;
-	u32 queue, bridge_ctrl, val;
+	u32 queue, bridge_ctrl, val, bridge_members;
 	int i, j, port;
 	struct ppe_acl_set acl_set;
+
+	bridge_members = info->bridge_mode ?
+		ipq_ppe_bridge_member_mask(info) : 0;
 
 	/* tdm/sched configuration */
 	ipq_ppe_tdm_configuration(info);
@@ -1943,8 +1972,12 @@ void ipq_ppe_provision_init(struct ppe_info *info)
 		ipq_ppe_vp_port_tbl_set(reg_base, 0, 2);
 
 	for (i = 1, j = 2; i <= info->no_ports; ++i) {
-		/* Add port 1 - 2 to VSI 2 */
-		ipq_ppe_vp_port_tbl_set(reg_base, i, j);
+		/* Keep recovery WAN/out-of-bridge ports in private VSIs. */
+		if (info->bridge_mode && !(bridge_members & BIT(i)))
+			ipq_ppe_vp_port_tbl_set(reg_base, i, 2 + i);
+		else
+			/* Add the selected physical ports to the recovery VSI. */
+			ipq_ppe_vp_port_tbl_set(reg_base, i, j);
 
 		if (!info->bridge_mode)
 			++j;
@@ -2065,20 +2098,20 @@ void ipq_ppe_provision_init(struct ppe_info *info)
 
 	for (i = 0; i < info->nos_iports; i++) {
 		bridge_ctrl = PPE_PORT_BRIDGE_CTRL_OFFSET;
+		val = info->bridge_mode ?
+			ipq_ppe_bridge_isolation_value(info, i) :
+			ppe_port_bridge_isolation_mask(info->nos_iports);
 		if (i == 0) {
-			val = ppe_port_bridge_promisc_mask() |
+			val |= ppe_port_bridge_promisc_mask() |
 				ppe_port_bridge_txmac_mask() |
-				ppe_port_bridge_isolation_mask(info->nos_iports) |
 				PPE_PORT_BRIDGE_CTRL_STATION_LRN_EN |
 				PPE_PORT_BRIDGE_CTRL_NEW_ADDR_LRN_EN;
 		} else if (i == 7) {
-			val = ppe_port_bridge_promisc_mask() |
-				ppe_port_bridge_isolation_mask(info->nos_iports) |
+			val |= ppe_port_bridge_promisc_mask() |
 				PPE_PORT_BRIDGE_CTRL_STATION_LRN_EN |
 				PPE_PORT_BRIDGE_CTRL_NEW_ADDR_LRN_EN;
 		} else {
-			val = ppe_port_bridge_promisc_mask() |
-			      ppe_port_bridge_isolation_mask(info->nos_iports);
+			val |= ppe_port_bridge_promisc_mask();
 		}
 		writel(val, reg_base + bridge_ctrl + (i * 4));
 	}
@@ -2087,7 +2120,11 @@ void ipq_ppe_provision_init(struct ppe_info *info)
 	writel(0xc0, reg_base + 0x060038);
 
 	if (info->bridge_mode) {
-		ipq_vsi_setup(reg_base, 2, info->vsi);
+		ipq_vsi_setup(reg_base, 2, bridge_members);
+		for (i = 1; i <= info->no_ports; ++i) {
+			if (!(bridge_members & BIT(i)))
+				ipq_vsi_setup(reg_base, 2 + i, BIT(i));
+		}
 	} else {
 		for (i = 0, j = 2;
 			i <= info->no_ports && i < CONFIG_ETH_MAX_MAC;
@@ -2118,7 +2155,7 @@ void ipq_ppe_provision_init(struct ppe_info *info)
 	/* Dropping all the UDP packets */
 	ipq_ppe_acl_set(&acl_set);
 
-	if (IS_ENABLED(CONFIG_TFTP_PORT)) {
+	if (IS_ENABLED(CONFIG_CMD_TFTPBOOT)) {
 		tftp_acl_our_port = 1024 + (get_timer(0) % 3072);
 
 		UPDATE_ACL_SET(acl_set, reg_base, 3, 0x4, 0x1,
@@ -5859,7 +5896,16 @@ static int ipq_eth_refresh_link(struct ipq_eth_dev *priv, bool quiet)
 			port->duplex = duplex;
 		}
 
-		priv->ppe.nbport = port->id;
+		/*
+		 * In bridge mode packets emitted by the CPU enter the shared VSI
+		 * through PPE port 0 and the hardware bridge selects the physical
+		 * egress port.  Do not replace that CPU-port destination with the
+		 * last PHY seen during a link refresh; when a 10G WAN comes up after
+		 * a LAN port, DHCP/HTTP replies would otherwise be directed at the
+		 * WAN port.  Non-bridge mode still needs the selected physical port.
+		 */
+		if (!priv->ppe.bridge_mode)
+			priv->ppe.nbport = port->id;
 	}
 
 	return linkup;
@@ -5946,7 +5992,7 @@ static int ipq_eth_start(struct udevice *dev)
 	if (priv->ppe.bridge_mode)
 		priv->ppe.nbport = 0;
 
-	if (IS_ENABLED(CONFIG_TFTP_PORT))
+	if (IS_ENABLED(CONFIG_CMD_TFTPBOOT))
 		env_set_ulong("tftpsrcp", tftp_acl_our_port);
 
 	/* HTTP recovery sets eth_allow_no_link and does not need link chatter. */
@@ -7622,6 +7668,8 @@ static int ipq_eth_ofdata_to_platdata(struct udevice *dev)
 	ppe->no_reg = dev_read_u32_default(dev, "no_tdm_reg", 0);
 	ppe->tm = dev_read_bool(dev, "tdm_tm_support");
 	ppe->bridge_mode = dev_read_bool(dev, "bridge_mode");
+	ppe->bridge_port_mask = dev_read_u32_default(dev,
+						     "bridge-port-mask", 0);
 	if (!ppe->bridge_mode)
 		ppe->nbport = dev_read_u32_default(dev, "port", 0);
 

@@ -31,6 +31,7 @@
 #include <dm/pinctrl.h>
 #include <dm/uclass.h>
 #include <button.h>
+#include <smem.h>
 
 #ifdef crc32
 #undef crc32
@@ -211,6 +212,10 @@ static bool recovery_board_is_sbe1v1k(void)
 #define RECOVERY_SBE1V1K_LAYOUT_ENV "sbe1v1k_partition_profile"
 #define RECOVERY_QWRT_AUTH_CODE_LEN (SHA256_SUM_LEN * 2U)
 #define RECOVERY_QWRT_SERIAL_MAX 32U
+#define RECOVERY_QWRT_ENV_SCAN_BYTES 65535U
+#define RECOVERY_QWRT_SMEM_SOCINFO_ITEM 137U
+#define RECOVERY_QWRT_SMEM_SERIAL_OFF 96U
+#define RECOVERY_QWRT_SMEM_SERIAL_SIZE 4U
 #define RECOVERY_QWRT_BUTTON_PRESSES 5U
 #define RECOVERY_QWRT_BUTTON_WINDOW_MS 10000UL
 #define RECOVERY_PARTITIONS_JSON_MAX (32 * 1024UL)
@@ -1980,16 +1985,15 @@ recovery_sbe1v1k_tar_layout(const char *board, const char *control_layout,
 		!strcmp(board, "spectrum,sbe1v1k");
 	if (spectrum) {
 		/*
-		 * Unmarked Spectrum QSDK/QWRT images use the active GPT profile.
-		 * This keeps the same image compatible with both the factory/mainline
-		 * HLOS layout and the migrated large kernel layout. Repacked images
-		 * may still pin their intended profile with SBE1V1K_LAYOUT.
+		 * Stock Spectrum QSDK/QWRT images identify only the board. Their
+		 * platform scripts write 0:HLOS and rootfs, so an unmarked image is
+		 * always a Mainline/QWRT image. Never infer Large from the active GPT:
+		 * doing so would place an HLOS image at the Large kernel offset.
+		 * Repacked Large images must pin their intended profile explicitly.
 		 */
 		if (!control_layout) {
 			if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
 				*layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
-			else if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_LARGE)
-				*layout = RECOVERY_SBE1V1K_LAYOUT_LARGE;
 			else
 				*layout = RECOVERY_SBE1V1K_LAYOUT_MAINLINE;
 			return 0;
@@ -2036,6 +2040,50 @@ static void recovery_qwrt_secure_zero(void *data, size_t size)
 		*bytes++ = 0;
 }
 
+/*
+ * Linux qcom_socinfo exposes serial_number from SMEM item 137.  The
+ * serial_num field was added in socinfo format version 10 and is at offset
+ * 96 in the little-endian item (the field immediately after foundry_id in
+ * Linux's struct socinfo). Read it here so U-Boot and soc_auth use the
+ * same immutable SoC identity instead of a possibly stale environment value.
+ */
+static int recovery_qwrt_serial_from_smem(char *serial, size_t size)
+{
+#if !IS_ENABLED(CONFIG_SMEM)
+	(void)serial;
+	(void)size;
+	return -ENOSYS;
+#else
+	struct udevice *smem;
+	const u8 *socinfo;
+	size_t item_size;
+	u32 serial_num;
+	int length;
+	int ret;
+
+	if (!serial || size < RECOVERY_QWRT_SERIAL_MAX)
+		return -EINVAL;
+
+	ret = uclass_get_device(UCLASS_SMEM, 0, &smem);
+	if (ret)
+		return ret;
+
+	socinfo = smem_get(smem, -1, RECOVERY_QWRT_SMEM_SOCINFO_ITEM,
+				   &item_size);
+	if (IS_ERR(socinfo))
+		return PTR_ERR(socinfo);
+	if (!socinfo || item_size < RECOVERY_QWRT_SMEM_SERIAL_OFF +
+					RECOVERY_QWRT_SMEM_SERIAL_SIZE)
+		return -ENODATA;
+
+	serial_num = get_unaligned_le32(socinfo + RECOVERY_QWRT_SMEM_SERIAL_OFF);
+	length = snprintf(serial, size, "%u", serial_num);
+	if (length < 0)
+		return -EINVAL;
+	return (size_t)length < size ? 0 : -ENOSPC;
+#endif
+}
+
 static int recovery_qwrt_serial_from_bootargs(char *serial, size_t size)
 {
 	ofnode chosen;
@@ -2074,21 +2122,41 @@ static int recovery_qwrt_normalize_serial(const char *input,
 					   char *serial, size_t size)
 {
 	unsigned long long value;
+	const char *digits = input;
 	char *end;
+	int base = 10;
 	int ret;
 
 	if (!input || !*input || !serial || size < RECOVERY_QWRT_SERIAL_MAX)
 		return -EINVAL;
 
-	if (!strncmp(input, "0x", 2) || !strncmp(input, "0X", 2)) {
-		value = simple_strtoull(input + 2, &end, 16);
-		if (end == input + 2 || *end)
-			return -EINVAL;
+	if (!strncmp(digits, "0x", 2) || !strncmp(digits, "0X", 2)) {
+		base = 16;
+		digits += 2;
 	} else {
-		value = simple_strtoull(input, &end, 10);
-		if (end == input || *end)
+		const char *p;
+		bool has_non_decimal = false;
+
+		/* qcom_set_serialno() may leave a bare hexadecimal value in env. */
+		for (p = digits; *p; p++) {
+			if (*p >= '0' && *p <= '9')
+				continue;
+			if ((*p >= 'a' && *p <= 'f') ||
+			    (*p >= 'A' && *p <= 'F')) {
+				has_non_decimal = true;
+				continue;
+			}
 			return -EINVAL;
+		}
+		if (has_non_decimal)
+			base = 16;
 	}
+
+	if (!*digits)
+		return -EINVAL;
+	value = simple_strtoull(digits, &end, base);
+	if (end == digits || *end)
+		return -EINVAL;
 
 	if (value > 0xffffffffULL)
 		return -ERANGE;
@@ -2127,14 +2195,18 @@ static int recovery_qwrt_auth_code(char auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 
 	int ret;
 	size_t i;
 
-	env_serial = env_get("serial#");
-	if (env_serial && *env_serial)
-		strlcpy(raw_serial, env_serial, sizeof(raw_serial));
-	else {
-		ret = recovery_qwrt_serial_from_bootargs(raw_serial,
+	/* The kernel's socinfo driver uses this value as the authoritative ID. */
+	ret = recovery_qwrt_serial_from_smem(raw_serial, sizeof(raw_serial));
+	if (ret) {
+		env_serial = env_get("serial#");
+		if (env_serial && *env_serial)
+			strlcpy(raw_serial, env_serial, sizeof(raw_serial));
+		else {
+			ret = recovery_qwrt_serial_from_bootargs(raw_serial,
 							 sizeof(raw_serial));
-		if (ret)
-			return ret;
+			if (ret)
+				return ret;
+		}
 	}
 
 	ret = recovery_qwrt_normalize_serial(raw_serial, serial,
@@ -2167,6 +2239,14 @@ static void recovery_qwrt_button_reset(void)
 
 static void recovery_qwrt_button_init(void)
 {
+#if !IS_ENABLED(CONFIG_BUTTON)
+	qwrt_button_unlocked = false;
+	qwrt_button_available = false;
+	qwrt_button = NULL;
+	qwrt_button_last_state = BUTTON_OFF;
+	recovery_qwrt_button_reset();
+	return;
+#else
 	int ret;
 
 	qwrt_button_unlocked = false;
@@ -2186,10 +2266,14 @@ static void recovery_qwrt_button_init(void)
 		    qwrt_button_last_state >= BUTTON_COUNT)
 			qwrt_button_last_state = BUTTON_OFF;
 	}
+#endif
 }
 
 static void recovery_qwrt_button_poll(void)
 {
+#if !IS_ENABLED(CONFIG_BUTTON)
+	return;
+#else
 	enum button_state_t state;
 	ulong now;
 
@@ -2217,6 +2301,7 @@ static void recovery_qwrt_button_poll(void)
 	}
 
 	qwrt_button_last_state = state;
+#endif
 }
 
 /*
@@ -2893,10 +2978,13 @@ static int recovery_mmc_stream_prepare(enum upload_target target, size_t size,
 		ret = recovery_require_sbe1v1k_firmware_layout();
 		if (ret)
 			return ret;
-		ret = recovery_refresh_qwrt_auth_code();
-		if (ret) {
-			printf("Cannot refresh QWRT auth_code before erase: %d\n", ret);
-			return ret;
+		if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+			ret = recovery_refresh_qwrt_auth_code();
+			if (ret) {
+				printf("Cannot refresh QWRT auth_code before erase: %d\n",
+				       ret);
+				return ret;
+			}
 		}
 	}
 
@@ -4072,11 +4160,7 @@ static int recovery_detect_sbe1v1k_layout(void)
 		return recovery_apply_sbe1v1k_factory_recovery();
 
 	if (!recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_large, false)) {
-		enum recovery_sbe1v1k_layout persisted_layout;
-
-		if (!recovery_read_sbe1v1k_layout_marker(&persisted_layout) &&
-		    persisted_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
-			return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_qwrt);
+		/* QWRT is restricted to the factory-compatible geometry below. */
 		return recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_large);
 	}
 
@@ -4307,6 +4391,15 @@ static int recovery_load_appsblenv(u8 **bufp, size_t *env_bytesp,
 	u8 *buf;
 	int ret;
 
+	/* APPSBLENV is always in the eMMC user area.  A previous backup or
+	 * restore request may have left the block device on boot0/boot1. */
+	ret = blk_get_device_by_str("mmc", recovery_mmcdev(), &desc);
+	if (ret < 0)
+		return ret;
+	ret = blk_dselect_hwpart(desc, EMMC_HWPART_DEFAULT);
+	if (ret)
+		return ret;
+
 	ret = recovery_get_mmc_part(RECOVERY_APPSBLENV_PART, &desc, &part);
 	if (ret)
 		return ret;
@@ -4421,18 +4514,38 @@ static int recovery_env_append(char *data, size_t data_size, size_t *offp,
 
 static int recovery_update_env_data(u8 *env_data, size_t data_size,
 				    const struct recovery_env_update *updates,
-				    size_t update_count)
+				    size_t update_count, const char *priority_key)
 {
 	char *new_data;
 	size_t old_off = 0;
 	size_t new_off = 0;
 	size_t i;
+	bool priority_found = false;
 	int ret = 0;
 
 	new_data = malloc(data_size);
 	if (!new_data)
 		return -ENOMEM;
 	memset(new_data, 0, data_size);
+
+	/*
+	 * soc_auth.ko only scans the first 65535 bytes of APPSBLENV.  Keep its
+	 * entry at the beginning of the serialized environment instead of
+	 * appending it after an arbitrary number of vendor variables.
+	 */
+	if (priority_key) {
+		for (i = 0; i < update_count; i++) {
+			if (strcmp(updates[i].key, priority_key))
+				continue;
+
+			ret = recovery_env_append(new_data, data_size, &new_off,
+						  updates[i].key, updates[i].value);
+			if (ret)
+				goto out;
+			priority_found = true;
+			break;
+		}
+	}
 
 	while (old_off < data_size && env_data[old_off]) {
 		const char *entry = (const char *)env_data + old_off;
@@ -4457,8 +4570,11 @@ static int recovery_update_env_data(u8 *env_data, size_t data_size,
 	}
 
 	for (i = 0; i < update_count; i++) {
+		if (priority_found && !strcmp(updates[i].key, priority_key))
+			continue;
+
 		ret = recovery_env_append(new_data, data_size, &new_off,
-					  updates[i].key, updates[i].value);
+						  updates[i].key, updates[i].value);
 		if (ret)
 			goto out;
 	}
@@ -4471,8 +4587,8 @@ out:
 }
 
 static const char *recovery_env_find_value(const u8 *env_data,
-					   size_t data_size,
-					   const char *key)
+						   size_t data_size,
+						   const char *key)
 {
 	size_t off = 0;
 
@@ -4491,6 +4607,24 @@ static const char *recovery_env_find_value(const u8 *env_data,
 	}
 
 	return NULL;
+}
+
+/*
+ * soc_auth.ko reads at most 65535 bytes from each environment partition.
+ * Keep a separate bounded lookup so a valid value beyond that window cannot
+ * make U-Boot believe the kernel module will find it.
+ */
+static const char *recovery_env_find_auth_code(const u8 *env_data,
+						       size_t data_size)
+{
+	size_t scan_size;
+
+	/* The vendor reads the CRC and then scans the remaining bytes. */
+	scan_size = min_t(size_t, data_size,
+					 RECOVERY_QWRT_ENV_SCAN_BYTES -
+					 RECOVERY_ENV_CRC_SIZE);
+
+	return recovery_env_find_value(env_data, scan_size, "auth_code");
 }
 
 static int recovery_read_sbe1v1k_layout_marker(
@@ -4542,7 +4676,10 @@ static int recovery_verify_env_updates(const u8 *env_data, size_t data_size,
 	size_t i;
 
 	for (i = 0; i < update_count; i++) {
-		value = recovery_env_find_value(env_data, data_size,
+		if (!strcmp(updates[i].key, "auth_code"))
+			value = recovery_env_find_auth_code(env_data, data_size);
+		else
+			value = recovery_env_find_value(env_data, data_size,
 						updates[i].key);
 		if (!value) {
 			printf("APPSBLENV missing '%s' after write\n",
@@ -4560,7 +4697,7 @@ static int recovery_verify_env_updates(const u8 *env_data, size_t data_size,
 	return 0;
 }
 
-/* Refresh the QWRT identity value before any firmware target is erased. */
+/* Refresh the QWRT identity before any firmware target is erased. */
 static int recovery_refresh_qwrt_auth_code(void)
 {
 	const struct recovery_env_update update = { "auth_code", NULL };
@@ -4568,12 +4705,13 @@ static int recovery_refresh_qwrt_auth_code(void)
 	struct disk_partition part;
 	struct blk_desc *desc;
 	char auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	const char *existing;
 	u8 *env_buf = NULL;
 	size_t env_bytes;
 	u32 crc;
 	int ret;
 
-	if (!recovery_board_is_sbe1v1k() ||
+	if (!recovery_board_is_sbe1v1k() || !recovery_backend_is_mmc() ||
 	    active_sbe1v1k_layout != RECOVERY_SBE1V1K_LAYOUT_QWRT)
 		return 0;
 
@@ -4589,9 +4727,18 @@ static int recovery_refresh_qwrt_auth_code(void)
 	ret = recovery_verify_appsblenv_crc(env_buf, env_bytes);
 	if (ret)
 		goto out;
+
+	/* Avoid rewriting the 256 KiB environment on every boot. */
+	existing = recovery_env_find_auth_code(env_buf + RECOVERY_ENV_CRC_SIZE,
+					       env_bytes - RECOVERY_ENV_CRC_SIZE);
+	if (existing && !strcmp(existing, auth_code)) {
+		ret = 0;
+		goto out;
+	}
+
 	ret = recovery_update_env_data(env_buf + RECOVERY_ENV_CRC_SIZE,
 				       env_bytes - RECOVERY_ENV_CRC_SIZE,
-				       &env_update, 1);
+				       &env_update, 1, "auth_code");
 	if (ret)
 		goto out;
 
@@ -4623,6 +4770,39 @@ out:
 	return ret;
 }
 
+/*
+ * QWRT is the only profile that consumes auth_code. Detect the profile
+ * first so Mainline/Large boots never modify the factory environment.
+ */
+int recovery_sbe1v1k_prepare_auth(void)
+{
+	enum recovery_sbe1v1k_layout persisted_layout;
+	int ret;
+
+	if (!recovery_board_is_sbe1v1k() || !recovery_backend_is_mmc())
+		return 0;
+
+	if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_UNKNOWN) {
+		/*
+		 * A QWRT marker is sufficient to refresh auth_code even if a
+		 * vendor GPT variant cannot be fully classified. HTTP recovery
+		 * performs the stricter geometry check before any flash operation.
+		 */
+		ret = recovery_read_sbe1v1k_layout_marker(&persisted_layout);
+		if (!ret && persisted_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT)
+			active_sbe1v1k_layout = RECOVERY_SBE1V1K_LAYOUT_QWRT;
+		else {
+			ret = recovery_detect_sbe1v1k_layout();
+			if (ret)
+				return ret;
+		}
+	}
+	if (active_sbe1v1k_layout != RECOVERY_SBE1V1K_LAYOUT_QWRT)
+		return 0;
+
+	return recovery_refresh_qwrt_auth_code();
+}
+
 static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds,
 				    size_t progress_base,
 				    const struct recovery_sbe1v1k_layout_desc *layout)
@@ -4630,7 +4810,7 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 	char bootargs[128];
 	char boot_chainloader[128];
 	char bootcmd[384];
-	char qwrt_auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	char qwrt_auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1] = { 0 };
 	struct recovery_env_update updates[7] = {
 		{ "bootargs", bootargs },
 		{ "boot_chainloader", boot_chainloader },
@@ -4684,7 +4864,7 @@ static int recovery_write_appsblenv(struct recovery_status_led_ctrl *status_leds
 
 	ret = recovery_update_env_data(env_buf + RECOVERY_ENV_CRC_SIZE,
 				       env_bytes - RECOVERY_ENV_CRC_SIZE,
-				       updates, update_count);
+				       updates, update_count, "auth_code");
 	if (ret)
 		goto out;
 
@@ -4787,7 +4967,7 @@ static int recovery_repartition_factory(
 {
 	const struct recovery_sbe1v1k_layout_desc *layout =
 		recovery_sbe1v1k_layout_desc(layout_id);
-	char qwrt_auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	char qwrt_auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1] = { 0 };
 	void *chainloader_fit;
 	size_t chainloader_size;
 	size_t hlos_clone_size;
@@ -4962,10 +5142,13 @@ static int recovery_flash_mmc_firmware(struct recovery_status_led_ctrl *status_l
 			return ret;
 	}
 
-	ret = recovery_refresh_qwrt_auth_code();
-	if (ret) {
-		printf("Cannot refresh QWRT auth_code before erase: %d\n", ret);
-		return ret;
+	if (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+		ret = recovery_refresh_qwrt_auth_code();
+		if (ret) {
+			printf("Cannot refresh QWRT auth_code before erase: %d\n",
+			       ret);
+			return ret;
+		}
 	}
 
 	ret = recovery_mmc_check_part_size(kernel_part, image.kernel.size);

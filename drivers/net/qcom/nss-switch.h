@@ -1760,6 +1760,8 @@ struct ppe_info {
 	u8 ipo_action;
 	bool tm;
 	bool bridge_mode;
+	/* Bridge-mode VSI members; zero selects the hardware default. */
+	u32 bridge_port_mask;
 	/* Per-port scheduler configuration (passed via ppe_info) */
 	struct port_scheduler_cfg *port_sched_cfg;
 	u32 port_sched_cfg_len;

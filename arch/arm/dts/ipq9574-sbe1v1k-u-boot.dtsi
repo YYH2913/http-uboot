@@ -142,6 +142,8 @@
 	tdm_mode = <0>;
 	no_tdm_reg = <118>;
 	bridge_mode;
+	/* Recovery bridge: CPU and LAN ports only; keep 10G WAN isolated. */
+	bridge-port-mask = <0x3f>;
 	status = "okay";
 };
 

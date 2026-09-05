@@ -679,6 +679,22 @@ tftp_init_client(const struct tftp_context *ctx)
 }
 
 /** @ingroup tftp
+ * Bind the TFTP client to a specific local UDP port.
+ * @param port Local UDP port in host byte order
+ */
+err_t
+tftp_client_bind(u16_t port)
+{
+  LWIP_ERROR("TFTP client is not enabled (tftp_init)",
+             (tftp_state.tftp_mode & LWIP_TFTP_MODE_CLIENT) != 0,
+             return ERR_VAL);
+  LWIP_ERROR("TFTP client PCB is not initialized", tftp_state.upcb,
+             return ERR_VAL);
+
+  return udp_bind(tftp_state.upcb, IP_ANY_TYPE, port);
+}
+
+/** @ingroup tftp
  * Get the transfer size used by the TFTP client. The server may
  * report zero in case this is unsupported.
  */

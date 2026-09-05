@@ -280,6 +280,7 @@ button{touch-action:manipulation}
 }
 .warning strong{display:block;color:var(--warn-head);font-size:12px}
 .warning p{margin:3px 0 0;color:var(--warn-body);font-size:12px}
+.warning p.qwrt-risk{color:var(--danger);line-height:1.55;white-space:pre-line;unicode-bidi:plaintext;overflow-wrap:anywhere}
 .actions{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:22px}
 .action-note{margin:0;color:var(--muted);font-size:12px}
 .primary-button,.danger-button{
@@ -723,10 +724,10 @@ var layoutProfiles={
     target:"QWRT factory GPT",
     method:"Factory-compatible QWRT profile",
     limit:"LBA 110626",
-    copy:"Matches the QWRT wiping-firmware map and refreshes the device-bound authorization value before firmware erase.",
+    copy:"Uses the QWRT factory partition layout.",
     help:"Kernel: 0:HLOS · Root: rootfs · Chainloader: rsvd_2",
-    warningTitle:"Applies the QWRT factory profile",
-    warning:"The factory-compatible GPT is verified or rebuilt as needed. QWRT authorization is written to APPSBLENV before any destructive operation.",
+    warningTitle:"QWRT firmware risk",
+    warning:qwrtRiskWarning,
     action:"Enable QWRT profile",
     rows:[
       ["0:HLOS","81954","7 MiB","Boot FIT"],
@@ -850,7 +851,9 @@ function updateLayoutSelection(){
   document.getElementById("layout-copy").textContent=selected.copy;
   document.getElementById("layout-help").textContent=selected.help;
   document.getElementById("layout-warning-title").textContent=selected.warningTitle;
-  document.getElementById("layout-warning-copy").textContent=selected.warning;
+  var layoutWarningCopy=document.getElementById("layout-warning-copy");
+  layoutWarningCopy.textContent=selected.warning;
+  layoutWarningCopy.classList.toggle("qwrt-risk",layoutSelect.value==="qwrt");
   repartitionButton.textContent=selected.action;
   layoutRows.textContent="";
   for(var i=0;i<selected.rows.length;i++){

@@ -184,6 +184,7 @@ static int tftp_loop(struct udevice *udev, ulong addr, char *fname,
 		     ip_addr_t srvip, uint16_t srvport)
 {
 	int blksize = CONFIG_TFTP_BLOCKSIZE;
+	u16_t local_port;
 	struct netif *netif;
 	struct tftp_ctx ctx;
 	const char *ep;
@@ -215,6 +216,19 @@ static int tftp_loop(struct udevice *udev, ulong addr, char *fname,
 	err = tftp_init_client(&tftp_context);
 	if (!(err == ERR_OK || err == ERR_USE))
 		log_err("tftp_init_client err: %d\n", err);
+
+	ep = env_get("tftpsrcp");
+	if (ep) {
+		local_port = dectoul(ep, NULL);
+		err = tftp_client_bind(local_port);
+		if (err != ERR_OK) {
+			log_err("tftp_client_bind(%u) err: %d\n", local_port,
+				err);
+			tftp_cleanup();
+			net_lwip_remove_netif(netif);
+			return -1;
+		}
+	}
 
 	ep = env_get("tftpblocksize");
 	if (ep)
