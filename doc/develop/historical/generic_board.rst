@@ -64,17 +64,17 @@ separate function calls so that they can easily be included or excluded
 for a particular architecture. It also makes it easier to adopt Graeme's
 initcall proposal when it is ready.
 
-http://lists.denx.de/pipermail/u-boot/2012-January/114499.html
+https://patch.msgid.link/4F019ABB.9010201@gmail.com/
 
 This series removes the dependency on generic relocation. So relocation
 happens as one big chunk and is still completely arch-specific. See the
 relocation series for a proposed solution to this for ARM:
 
-http://lists.denx.de/pipermail/u-boot/2011-December/112928.html
+https://patch.msgid.link/CAPnjgZ0jesqX1Y71S5xoYQDGPuARfOX48RGbU9Mw=P5HGYcOKg@mail.gmail.com/
 
 or Graeme's recent x86 series v2:
 
-http://lists.denx.de/pipermail/u-boot/2012-January/114467.html
+https://patch.msgid.link/1325477374-6417-1-git-send-email-graeme.russ@gmail.com/
 
 Instead of moving over a whole architecture, this series takes the approach
 of simply enabling generic board support for an architecture. It is then up

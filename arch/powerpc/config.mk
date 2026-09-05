@@ -32,7 +32,7 @@ archprepare: checkgcc4
 
 # GCC 3.x is reported to have problems generating the type of relocation
 # that U-Boot wants.
-# See http://lists.denx.de/pipermail/u-boot/2012-September/135156.html
+# See https://patch.msgid.link/1348500648.2514.2.camel@petert/
 checkgcc4:
 	@if test "$(call cc-name)" = "gcc" -a \
 			$(call cc-version) -lt 0400; then \

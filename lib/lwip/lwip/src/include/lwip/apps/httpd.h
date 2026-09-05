@@ -236,6 +236,18 @@ err_t httpd_post_receive_data(void *connection, struct pbuf *p);
  */
 void httpd_post_finished(void *connection, char *response_uri, u16_t response_uri_len);
 
+#if LWIP_HTTPD_POST_RESPONSE_ACK
+/**
+ * Called after the POST response has been acknowledged, or when its
+ * connection fails before acknowledgment.
+ *
+ * @param connection Unique connection identifier, valid only during this call.
+ * @param result ERR_OK when all response bytes were acknowledged, otherwise
+ *        the connection error that prevented acknowledgment.
+ */
+void httpd_post_response_complete(void *connection, err_t result);
+#endif /* LWIP_HTTPD_POST_RESPONSE_ACK */
+
 #if LWIP_HTTPD_POST_MANUAL_WND
 void httpd_post_data_recved(void *connection, u16_t recved_len);
 #endif /* LWIP_HTTPD_POST_MANUAL_WND */

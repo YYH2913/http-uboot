@@ -35,6 +35,7 @@ void (*push_packet)(void *, int len) = 0;
 int net_try_count;
 static int net_restarted;
 int net_restart_wrap;
+static int net_lwip_eth_started;
 static uchar net_pkt_buf[(PKTBUFSRX) * PKTSIZE_ALIGN + PKTALIGN]
 	__aligned(PKTALIGN);
 /* NO_SYS lwIP serializes linkoutput calls and U-Boot drivers copy on send. */
@@ -271,16 +272,31 @@ int net_lwip_eth_start(void)
 {
 	int ret;
 
+	if (net_lwip_eth_started++ > 0)
+		return 0;
+
 	net_init();
 	eth_halt();
 	eth_set_current();
 	ret = eth_init();
 	if (ret < 0) {
+		net_lwip_eth_started--;
 		eth_halt();
 		return ret;
 	}
 
 	return 0;
+}
+
+void net_lwip_eth_stop(void)
+{
+	if (!net_lwip_eth_started)
+		return;
+
+	if (--net_lwip_eth_started)
+		return;
+
+	eth_halt();
 }
 
 static struct netif *new_netif(struct udevice *udev, bool with_ip)
@@ -427,6 +443,7 @@ int net_lwip_rx(struct udevice *udev, struct netif *netif)
 
 	flags = ETH_RECV_CHECK_DEVICE;
 	for (i = 0; i < ETH_PACKETS_BATCH_RECV; i++) {
+		net_lwip_run_recovery_poll_hook();
 		len = eth_get_ops(udev)->recv(udev, flags, &packet);
 		flags = 0;
 

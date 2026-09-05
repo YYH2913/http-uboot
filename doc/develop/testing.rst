@@ -22,7 +22,7 @@ the quick ones, type this::
 
     make qcheck
 
-It is also possible to run just the tests for tools (patman, binman, etc.).
+It is also possible to run just the tests for tools (binman, buildman, etc.).
 Such tests are included with those tools, i.e. no actual U-Boot unit tests are
 run. Type this::
 

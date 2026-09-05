@@ -26,4 +26,4 @@ classifiers = [
 binman = "binman.main:start_binman"
 
 [tool.setuptools.package-data]
-patman = ["*.rst"]
+binman = ["*.rst"]

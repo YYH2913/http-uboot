@@ -205,7 +205,7 @@ static int rkcommon_get_aligned_size(struct image_tool_params *params,
 
 	/*
 	 * Pad to a 2KB alignment, as required for init/boot size by the ROM
-	 * (see https://lists.denx.de/pipermail/u-boot/2017-May/293268.html)
+	 * (see https://patch.msgid.link/CANbgqAQPw5Dxp7Qm_aZoL1nggg9Mm1SQoKvx=V5a8p-9+DTDNw@mail.gmail.com/)
 	 */
 	return ROUND(size, RK_SIZE_ALIGN);
 }
@@ -328,7 +328,7 @@ static void rkcommon_set_header0(void *buf, struct image_tool_params *params)
 	 * to determine the size of the next-stage bootloader (e.g. U-Boot
 	 * proper), when used with the back-to-bootrom functionality.
 	 *
-	 * see https://lists.denx.de/pipermail/u-boot/2017-May/293267.html
+	 * see https://patch.msgid.link/CANbgqAQ5p-fE4T-Ye9UAMs-nRGU8AP_yxDf+5SbZbP8bxLa0dg@mail.gmail.com/
 	 * for a more detailed explanation by Andy Yan
 	 */
 	if (spl_params.boot_file)

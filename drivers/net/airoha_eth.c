@@ -30,6 +30,7 @@
 #include <linux/mii.h>
 #include <linux/iopoll.h>
 #include <linux/time.h>
+#include <vsprintf.h>
 #include <asm/arch/scu-regmap.h>
 
 #ifndef MDIO_USXGMII_LINK
@@ -598,6 +599,7 @@ struct airoha_queue {
 	struct airoha_qdma_desc *desc;
 	uchar *rx_buf;
 	u16 head;
+	bool pending;
 
 	int ndesc;
 };
@@ -4106,6 +4108,12 @@ static int airoha_qdma_init_tx_queue(struct airoha_queue *q,
 	q->ndesc = size;
 	q->head = 0;
 
+	q->tx_buf = memalign(ARCH_DMA_MINALIGN, AIROHA_MAX_PACKET_SIZE);
+	if (!q->tx_buf)
+		return -ENOMEM;
+
+	memset(q->tx_buf, 0, AIROHA_MAX_PACKET_SIZE);
+
 	q->desc = dma_alloc_coherent(q->ndesc * sizeof(*q->desc), &dma_addr);
 	if (!q->desc)
 		return -ENOMEM;
@@ -4398,6 +4406,32 @@ static int airoha_hw_init(struct udevice *dev, struct airoha_eth *eth)
 	}
 
 	return 0;
+}
+
+static void airoha_switch_recovery_runtime_init(struct airoha_eth *eth)
+{
+	u32 cpu_port_mask = BIT(AIROHA_RECOVERY_SWITCH_CPU_PORT);
+
+	if (!eth->switch_regs)
+		return;
+
+	/*
+	 * This mirrors the recovery-facing switch setup done at probe time, but
+	 * avoids PHY resets and RTL8261 patching. It makes http_recovery
+	 * re-enterable after eth_halt()/eth_init().
+	 */
+	airoha_switch_wr(eth, SWITCH_MFC,
+			 FIELD_PREP(SWITCH_BC_FFP, cpu_port_mask) |
+				 FIELD_PREP(SWITCH_UNM_FFP, cpu_port_mask) |
+				 FIELD_PREP(SWITCH_UNU_FFP, cpu_port_mask));
+	airoha_switch_rmw(eth, SWITCH_CFC, SWITCH_CPU_PMAP,
+			  FIELD_PREP(SWITCH_CPU_PMAP, cpu_port_mask));
+	airoha_switch_rmw(eth, SWITCH_AGC, 0, SWITCH_LOCAL_EN);
+	airoha_switch_wr(eth, SWITCH_CPORT_SPTAG_CFG,
+			 SWITCH_SW2FE_STAG_EN | SWITCH_FE2SW_STAG_EN);
+
+	airoha_switch_recovery_program_ports(eth, true);
+	airoha_switch_fdb_flush(eth);
 }
 
 static int airoha_switch_init(struct udevice *dev, struct airoha_eth *eth)
@@ -4725,7 +4759,24 @@ static int airoha_eth_send_on_fport(struct udevice *dev, void *packet,
 	qid = airoha_recovery_tx_qid(eth, fport);
 	q = &qdma->q_tx[qid];
 	desc = &q->desc[q->head];
+	if (q->pending) {
+		ret = airoha_qdma_wait_tx_done(desc);
+		if (ret) {
+			eth->last_tx_ret = ret;
+			eth->tx_err++;
+			return ret;
+		}
+
+		q->pending = false;
+		q->head = (q->head + 1) % q->ndesc;
+		airoha_qdma_rmw(qdma, REG_IRQ_CLEAR_LEN(0), IRQ_CLEAR_LEN_MASK, 1);
+		desc = &q->desc[q->head];
+	}
 	index = (q->head + 1) % q->ndesc;
+	memcpy(q->tx_buf, packet, length);
+	if (tx_length > length)
+		memset(q->tx_buf + length, 0, tx_length - length);
+	dma_addr = dma_map_single(q->tx_buf, tx_length, DMA_TO_DEVICE);
 
 	msg0 = airoha_recovery_tx_msg0(qid);
 	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK,
@@ -4742,23 +4793,19 @@ static int airoha_eth_send_on_fport(struct udevice *dev, void *packet,
 	WRITE_ONCE(desc->msg2, cpu_to_le32(0xffff));
 
 	dma_map_unaligned(desc, sizeof(*desc), DMA_TO_DEVICE);
+	q->pending = true;
 
 	airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid), TX_RING_CPU_IDX_MASK,
 			FIELD_PREP(TX_RING_CPU_IDX_MASK, index));
 
-	for (i = 0; i < 100; i++) {
-		dma_unmap_unaligned(virt_to_phys(desc), sizeof(*desc),
-				    DMA_FROM_DEVICE);
-		if (desc->ctrl & QDMA_DESC_DONE_MASK)
-			break;
-
-		udelay(1);
+	ret = airoha_qdma_wait_tx_done(desc);
+	if (ret) {
+		eth->last_tx_ret = ret;
+		eth->tx_err++;
+		return ret;
 	}
 
-	/* Return error if for some reason the descriptor never ACK */
-	if (!(desc->ctrl & QDMA_DESC_DONE_MASK))
-		return -EAGAIN;
-
+	q->pending = false;
 	q->head = index;
 	airoha_qdma_rmw(qdma, REG_IRQ_CLEAR_LEN(0), IRQ_CLEAR_LEN_MASK, 1);
 

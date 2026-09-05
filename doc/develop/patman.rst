@@ -1,1 +1,0 @@
-../../tools/patman/patman.rst

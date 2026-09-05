@@ -362,7 +362,6 @@ RUN wget -O /tmp/pytest-requirements.txt https://source.denx.de/u-boot/u-boot/-/
 RUN wget -O /tmp/sphinx-requirements.txt https://source.denx.de/u-boot/u-boot/-/raw/master/doc/sphinx/requirements.txt
 RUN wget -O /tmp/binman-requirements.txt https://source.denx.de/u-boot/u-boot/-/raw/master/tools/binman/requirements.txt
 RUN wget -O /tmp/buildman-requirements.txt https://source.denx.de/u-boot/u-boot/-/raw/master/tools/buildman/requirements.txt
-RUN wget -O /tmp/patman-requirements.txt https://source.denx.de/u-boot/u-boot/-/raw/master/tools/patman/requirements.txt
 RUN wget -O /tmp/u_boot_pylib-requirements.txt https://source.denx.de/u-boot/u-boot/-/raw/master/tools/u_boot_pylib/requirements.txt
 RUN python3 -m venv /tmp/venv && \
 	. /tmp/venv/bin/activate && \
@@ -370,7 +369,6 @@ RUN python3 -m venv /tmp/venv && \
 		-r /tmp/sphinx-requirements.txt \
 		-r /tmp/binman-requirements.txt \
 		-r /tmp/buildman-requirements.txt \
-		-r /tmp/patman-requirements.txt \
 		-r /tmp/u_boot_pylib-requirements.txt \
 		setuptools pytest-azurepipelines && \
 	deactivate && \

@@ -284,7 +284,7 @@ efi_status_t EFIAPI efi_selftest(efi_handle_t image_handle,
 			 * implemented we should call
 			 *   st_boottime->exit(image_handle, EFI_SUCCESS, 0, NULL);
 			 * here, cf.
-			 * https://lists.denx.de/pipermail/u-boot/2017-October/308720.html
+			 * https://patch.msgid.link/44453b06-5a09-ee3c-0a6a-b54bee9020e4@gmx.de/
 			 */
 			return EFI_SUCCESS;
 		}

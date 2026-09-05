@@ -42,9 +42,9 @@ Nyan-big
 
 Compiled based on information here::
 
-   https://lists.denx.de/pipermail/u-boot/2015-March/209530.html
+   https://patch.msgid.link/1427703262.24522.59.camel@collabora.co.uk/
    https://git.collabora.com/cgit/user/tomeu/u-boot.git/commit/?h=nyan-big
-   https://lists.denx.de/pipermail/u-boot/2017-May/289491.html
+   https://patch.msgid.link/CALr8Vo1WvO=m1W2zvT=MOQ3k-fNtcCtBjk2+zgKha0j28s8g6A@mail.gmail.com/
    https://github.com/chromeos-nvidia-androidtv/gnu-linux-on-acer-chromebook-13#copy-data-to-the-sd-card
 
 1. Build U-Boot

@@ -2721,10 +2721,11 @@ static int mmc_startup(struct mmc *mmc)
 
 #if CONFIG_IS_ENABLED(MMC_UHS_SUPPORT)
 		/*
-		 * If the card has already switched to 1.8V signaling, then
-		 * set the signal voltage to 1.8V.
+		 * If voltage switch was skipped during ACMD41 but the card is
+		 * already at 1.8V (retained from a previous session, e.g. warm
+		 * reboot), re-configure the host to match.
 		 */
-		if (mmc_sd_card_using_v18(mmc)) {
+		if (!(mmc->ocr & OCR_S18R) && mmc_sd_card_using_v18(mmc)) {
 			/*
 			 * During a signal voltage level switch, the clock must be gated
 			 * for 5 ms according to the SD spec.

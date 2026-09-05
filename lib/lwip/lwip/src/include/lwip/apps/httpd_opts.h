@@ -167,6 +167,14 @@
 #define LWIP_HTTPD_POST_MANUAL_WND  0
 #endif
 
+/** Wait for all POST response bytes to be acknowledged before closing the
+ * connection and notify the application of success or failure via
+ * httpd_post_response_complete().
+ */
+#if !defined LWIP_HTTPD_POST_RESPONSE_ACK || defined __DOXYGEN__
+#define LWIP_HTTPD_POST_RESPONSE_ACK 0
+#endif
+
 /** This string is passed in the HTTP header as "Server: " */
 #if !defined HTTPD_SERVER_AGENT || defined __DOXYGEN__
 #define HTTPD_SERVER_AGENT "lwIP/" LWIP_VERSION_STRING " (http://savannah.nongnu.org/projects/lwip)"

@@ -3,7 +3,7 @@
 VERSION = 2026
 PATCHLEVEL = 07
 SUBLEVEL =
-EXTRAVERSION = -rc4
+EXTRAVERSION =
 NAME =
 
 # *DOCUMENTATION*
@@ -829,6 +829,21 @@ autoconf_is_old := $(shell find . -path ./$(KCONFIG_CONFIG) -newer \
 						include/config/auto.conf)
 ifeq ($(autoconf_is_old),)
 include $(srctree)/config.mk
+
+ifeq ($(CONFIG_OF_UPSTREAM),y)
+ifeq ($(CONFIG_CPU_V8M),y)
+dt_dir := dts/upstream/src/arm64
+else
+ifeq ($(CONFIG_ARM64),y)
+dt_dir := dts/upstream/src/arm64
+else
+dt_dir := dts/upstream/src/$(ARCH)
+endif
+endif
+else
+dt_dir := arch/$(ARCH)/dts
+endif
+
 include $(srctree)/arch/$(ARCH)/Makefile
 endif
 endif
@@ -1444,20 +1459,6 @@ dt_binding_check: scripts_dtc
 
 quiet_cmd_copy = COPY    $@
       cmd_copy = cp $< $@
-
-ifeq ($(CONFIG_OF_UPSTREAM),y)
-ifeq ($(CONFIG_CPU_V8M),y)
-dt_dir := dts/upstream/src/arm64
-else
-ifeq ($(CONFIG_ARM64),y)
-dt_dir := dts/upstream/src/arm64
-else
-dt_dir := dts/upstream/src/$(ARCH)
-endif
-endif
-else
-dt_dir := arch/$(ARCH)/dts
-endif
 
 ifeq ($(CONFIG_MULTI_DTB_FIT),y)
 
@@ -2691,7 +2692,6 @@ pip pip_test pip_release: _pip
 
 _pip:
 	scripts/make_pip.sh u_boot_pylib ${PIP_ARGS}
-	scripts/make_pip.sh patman ${PIP_ARGS}
 	scripts/make_pip.sh buildman ${PIP_ARGS}
 	scripts/make_pip.sh dtoc ${PIP_ARGS}
 	scripts/make_pip.sh binman ${PIP_ARGS}

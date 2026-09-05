@@ -16,7 +16,6 @@ General
    docstyle
    kconfig
    memory
-   patman
    process
    release_cycle
    security

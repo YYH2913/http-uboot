@@ -649,8 +649,8 @@ board.
 Prepare patches and send them to the mailing lists
 --------------------------------------------------
 
-You can use 'tools/patman/patman' to prepare, check and send patches for
-your work. See tools/patman/README for details.
+You can prepare, check and send patches for your work using the tools described
+in :doc:`/develop/sending_patches`.
 
 A little note about SPI uclass features
 ---------------------------------------

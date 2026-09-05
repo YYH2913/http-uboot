@@ -17,7 +17,7 @@ and saving the environment to SPI NOR.
 
 It does not support 'boot from SD' at offset 0x400
 except through the 'bmode' command.
-	http://lists.denx.de/pipermail/u-boot/2012-August/131151.html
+	https://patch.msgid.link/1345062683-19134-1-git-send-email-troy.kisky@boundarydevices.com/
 
 2. Boots using 6x_bootscript on SATA or SD card
 -----------------------------------------------

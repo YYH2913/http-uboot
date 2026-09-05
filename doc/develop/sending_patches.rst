@@ -17,14 +17,71 @@ A good introduction how to prepare for submitting patches can be found in the
 LWN article `How to Get Your Change Into the Linux Kernel
 <http://lwn.net/Articles/139918/>`_ as the same rules apply to U-Boot, too.
 
+.. _b4_contrib:
+
+Using b4
+--------
+
+Use the `b4 <https://b4.docs.kernel.org/en/latest/>`__ tool to prepare and send
+your patches. b4 has become the preferred tool to sending patches for many Linux
+kernel contributors, and U-Boot ships with a ready-to-use ``.b4-config`` that
+targets ``u-boot@lists.denx.de`` and integrates with ``scripts/get_maintainer.pl``
+for recipient discovery.
+
+Start a topical series with ``b4 prep`` and keep the commits organised with
+``git rebase -i``. ``b4 prep --edit-cover`` opens an editor for the cover letter,
+while ``b4 prep --auto-to-cc`` collects reviewers and maintainers from both the
+configuration file and ``scripts/get_maintainer.pl``.
+
+.. code-block:: bash
+
+   b4 prep -n mmc-fixes
+   git rebase -i origin/master
+   b4 prep --edit-cover
+   b4 prep --auto-to-cc
+
+Run the style checks before sending. ``b4 prep --check`` wraps the existing
+tooling so you see the output from ``scripts/checkpatch.pl`` alongside b4's own
+validation. You can always invoke ``scripts/checkpatch.pl`` directly for
+additional runs.
+
+.. code-block:: bash
+
+   b4 prep --check
+
+When the series is ready, use ``b4 send``. Begin with ``--dry-run`` to review the
+generated emails and ``--reflect`` to copy yourself for records before
+dispatching to ``u-boot@lists.denx.de``.
+
+.. code-block:: bash
+
+   b4 send --dry-run
+   b4 send --reflect
+   b4 send
+
+After reviews arrive, collect Acked-by/Tested-by tags with ``b4 trailers -u`` and
+fold them into your commits before resending the updated series.
+
+.. code-block:: bash
+
+   b4 trailers -u
+   git rebase -i origin/master
+   b4 send
+
 Using patman
 ------------
 
 You can use a tool called patman to prepare, check and send patches. It creates
 change logs, cover letters and patch notes. It also simplifies the process of
-sending multiple versions of a series.
+sending multiple versions of a series. patman is driven by tags in your commit
+messages, and can collect Reviewed-by and other tags from patchwork when you
+send a new version. It can optionally keep a local database of all your series,
+tracking each version and their review / applied status over time, so you can
+easily track upstreaming progress.
 
-See more details at :doc:`patman`.
+patman now lives outside the U-Boot tree; install it with
+``pip install patch-manager``. See the
+`patman documentation <https://deinde.dev/patman>`_ for details.
 
 General Patch Submission Rules
 ------------------------------

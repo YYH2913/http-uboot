@@ -1,0 +1,32 @@
+# Default patman settings for the U-Boot tree
+#
+# patman is maintained separately; install it with:
+#     pip install patch-manager
+#
+# See https://deinde.dev/patman
+#
+# patman reads this file at the lowest priority, so anything set here is a
+# default that you can override in your own ~/.patman, in a local .patman or
+# on the command line. patman autodetects the U-Boot project and locates
+# scripts/get_maintainer.pl on its own; the patchwork server and get-maintainer
+# script are pinned here so U-Boot does not depend on patman's built-in
+# defaults in case those change.
+
+[settings]
+patchwork_url: https://patchwork.ozlabs.org
+get_maintainer_script: scripts/get_maintainer.pl --norolestats
+
+# Other settings you might set here as project defaults:
+# process_tags: True
+# add_signoff: True
+# check_patch: True
+# verbose: False
+# smtp_server: /path/to/sendmail
+
+# Aliases are recursive and are usually kept per-user in ~/.patman:
+# [alias]
+# me: Your Name <you@example.com>
+
+# Addresses known to bounce can be dropped from the recipient list:
+# [bounces]
+# someone: A Name <someone@example.com>
