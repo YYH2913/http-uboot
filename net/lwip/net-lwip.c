@@ -46,14 +46,36 @@ char *pxelinux_configfile;
 #if defined(CONFIG_HTTPD_RECOVERY)
 static net_lwip_udp_recv_fn recovery_dhcp_hook;
 static void *recovery_dhcp_hook_arg;
+static net_lwip_poll_fn recovery_poll_hook;
+static void *recovery_poll_hook_arg;
 
 void net_lwip_set_recovery_dhcp_hook(net_lwip_udp_recv_fn recv, void *arg)
 {
 	recovery_dhcp_hook = recv;
 	recovery_dhcp_hook_arg = arg;
 }
+
+void net_lwip_set_recovery_poll_hook(net_lwip_poll_fn poll, void *arg)
+{
+	recovery_poll_hook = poll;
+	recovery_poll_hook_arg = arg;
+}
+
+static void net_lwip_run_recovery_poll_hook(void)
+{
+	if (recovery_poll_hook)
+		recovery_poll_hook(recovery_poll_hook_arg);
+}
 #else
 void net_lwip_set_recovery_dhcp_hook(net_lwip_udp_recv_fn recv, void *arg)
+{
+}
+
+void net_lwip_set_recovery_poll_hook(net_lwip_poll_fn poll, void *arg)
+{
+}
+
+static void net_lwip_run_recovery_poll_hook(void)
 {
 }
 #endif
