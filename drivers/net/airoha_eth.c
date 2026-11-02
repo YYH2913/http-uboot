@@ -32,6 +32,7 @@
 #include <linux/time.h>
 #include <vsprintf.h>
 #include <asm/arch/scu-regmap.h>
+#include <dt-bindings/phy/phy.h>
 
 #ifndef MDIO_USXGMII_LINK
 #define MDIO_USXGMII_LINK BIT(15)
@@ -3802,26 +3803,40 @@ static void airoha_rtl8261_minimal_init(struct airoha_eth *eth)
 	eth->rtl8261_init_done = true;
 }
 
-static void airoha_rtl8261_read_phy_props(struct airoha_eth *eth, ofnode mdio_node)
+static bool airoha_rtl8261_read_polarity(ofnode node, const char *property,
+					 const char *legacy_property)
+{
+	u32 polarity;
+
+	if (!ofnode_read_u32(node, property, &polarity))
+		return polarity == PHY_POL_INVERT;
+
+	return ofnode_read_bool(node, legacy_property);
+}
+
+static void airoha_rtl8261_read_phy_props(struct airoha_eth *eth,
+					  ofnode mdio_node)
 {
 	ofnode child;
 
 	ofnode_for_each_subnode(child, mdio_node) {
+		bool pnswap_tx, pnswap_rx;
 		u32 reg;
 
 		reg = ofnode_read_u32_default(child, "reg", U32_MAX);
+		pnswap_tx = airoha_rtl8261_read_polarity(child, "tx-polarity",
+							 "realtek,pnswap-tx");
+		pnswap_rx = airoha_rtl8261_read_polarity(child, "rx-polarity",
+							 "realtek,pnswap-rx");
+
 		switch (reg) {
 		case RTL8261_PHY5_ADDR:
-			eth->rtl8261_phy5_pnswap_tx =
-				ofnode_read_bool(child, "realtek,pnswap-tx");
-			eth->rtl8261_phy5_pnswap_rx =
-				ofnode_read_bool(child, "realtek,pnswap-rx");
+			eth->rtl8261_phy5_pnswap_tx = pnswap_tx;
+			eth->rtl8261_phy5_pnswap_rx = pnswap_rx;
 			break;
 		case RTL8261_PHY8_ADDR:
-			eth->rtl8261_phy8_pnswap_tx =
-				ofnode_read_bool(child, "realtek,pnswap-tx");
-			eth->rtl8261_phy8_pnswap_rx =
-				ofnode_read_bool(child, "realtek,pnswap-rx");
+			eth->rtl8261_phy8_pnswap_tx = pnswap_tx;
+			eth->rtl8261_phy8_pnswap_rx = pnswap_rx;
 			break;
 		}
 	}
@@ -4487,6 +4502,22 @@ static void airoha_reset_ext_phys(ofnode mdio_node)
 	}
 }
 
+static void airoha_rtl8261_recovery_init(struct udevice *dev,
+					 struct airoha_eth *eth)
+{
+	ofnode mdio_node;
+
+	if (eth->rtl8261_init_done)
+		return;
+
+	mdio_node = airoha_ext_mdio_node(dev);
+	if (!ofnode_valid(mdio_node))
+		return;
+
+	airoha_reset_ext_phys(mdio_node);
+	airoha_rtl8261_minimal_init(eth);
+}
+
 static void airoha_enable_mdio_pins(struct airoha_eth *eth)
 {
 	if (!eth->chip_scu_regmap)
@@ -5138,8 +5169,6 @@ static int airoha_switch_init(struct udevice *dev, struct airoha_eth *eth)
 			eth->mdio_dev = NULL;
 	}
 
-	airoha_rtl8261_minimal_init(eth);
-
 	return 0;
 }
 
@@ -5232,15 +5261,6 @@ static int airoha_eth_probe(struct udevice *dev)
 	if (ret)
 		return ret;
 
-	switch_node =
-		ofnode_by_compatible(ofnode_null(), data->switch_compatible);
-	if (ofnode_valid(switch_node)) {
-		ofnode mdio_node = airoha_ext_mdio_node(dev);
-
-		if (ofnode_valid(mdio_node))
-			airoha_reset_ext_phys(mdio_node);
-	}
-
 	return airoha_switch_init(dev, eth);
 }
 
@@ -5252,6 +5272,7 @@ static int airoha_eth_init(struct udevice *dev)
 	airoha_recovery_runtime_reset(eth);
 	airoha_switch_recovery_quiesce(eth);
 	airoha_fe_recovery_runtime_stop(eth);
+	airoha_rtl8261_recovery_init(dev, eth);
 	airoha_recovery_lan_phy_set_power(eth, false);
 
 	for (i = 0; i < AIROHA_MAX_NUM_QDMA; i++) {
