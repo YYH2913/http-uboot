@@ -81,6 +81,7 @@ button,input,select{font:inherit;letter-spacing:0}
   transition:color .16s ease,background .16s ease,border-color .16s ease;
 }
 .nav-button:hover{color:var(--blue);background:#f6f9fe}
+a.nav-button{text-decoration:none}
 .nav-button.active{
   color:var(--blue-dark);
   border-color:#a9c8f4;
@@ -337,6 +338,7 @@ button,input,select{font:inherit;letter-spacing:0}
     <nav class='nav' aria-label='Recovery target'>
       <button class='nav-button active' type='button' data-target='firmware' aria-current='page'><span class='nav-dot'></span>Firmware Recovery</button>
       <button class='nav-button' type='button' data-target='uboot'><span class='nav-dot'></span>Update U-Boot</button>
+      <a class='nav-button' id='backup-link' href='/backup.html'><span class='nav-dot'></span>Flash Backup</a>
     </nav>
     <div class='side-meta'>
       <strong>192.168.255.1</strong>
@@ -697,7 +699,10 @@ async function upload(){
 
 var navButtons=document.querySelectorAll('.nav-button');
 for(var i=0;i<navButtons.length;i++){
-  navButtons[i].addEventListener('click',function(){setTarget(this.getAttribute('data-target'))});
+  navButtons[i].addEventListener('click',function(event){
+    if(busy){event.preventDefault();return;}
+    setTarget(this.getAttribute('data-target'));
+  });
 }
 chooseButton.addEventListener('click',function(){if(!busy)fileInput.click()});
 fileInput.addEventListener('change',function(){selectedFile=this.files[0]||null;validateFile()});
@@ -710,7 +715,7 @@ layoutSelect.addEventListener('change',function(){
 uploadButton.addEventListener('click',upload);
 
 (async function(){
-  setTarget('firmware');
+  setTarget(window.location.hash==='#uboot'?'uboot':'firmware');
   try{
     var response=await fetch('/about',{cache:'no-store'});
     var data=await response.json();

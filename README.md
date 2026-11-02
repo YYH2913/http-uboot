@@ -6,6 +6,45 @@ This is a customized U-Boot port for the XR1710G. Its main features are:
 - HTTP Recovery for convenient web-based firmware flashing
 - Built-in DHCP server so a connected PC can obtain an address automatically in recovery mode
 - Recovery page address: `http://192.168.255.1`
+- Read-only full SPI-NAND and individual MTD partition downloads at
+  `http://192.168.255.1/backup.html`
+
+## Flash Backup
+
+Enter HTTP recovery as described below, then select **Flash Backup** in the
+sidebar (or open `http://192.168.255.1/backup.html`). Choose the complete Flash
+or a partition and click **Download Backup**. Capacity, physical offsets and
+partition sizes are obtained from the current MTD devices, not hard-coded in
+the page. Use the browser's download manager to check completion, then use
+**Refresh Sources** to check whether the device is idle again.
+
+- `GET /backup/info` returns device geometry, operation availability and the
+  current MTD partitions with their indexes, offsets and sizes.
+- `GET /backup/full.bin` streams the complete `spi-nand0` data area (512 MiB
+  on XR1710G), including the vendor and reserved BMT/BBT regions.
+- `GET /backup/mtd<N>.bin` streams one direct partition of `spi-nand0`.
+  Use the index from `/backup/info`; U-Boot MTD indexes need not match Linux.
+
+Downloads are ECC-corrected data-area images, **not raw NAND+OOB programmer
+dumps**. No bad blocks are skipped, so physical offsets and the advertised
+byte count are preserved. Correctable ECC warnings are accepted; an
+uncorrectable error or short MTD read ends the HTTP stream early rather than
+padding or silently omitting data. Always verify the final file size.
+
+UBI 2.0, 1.5 and 1.0 are overlapping views starting at `0x00700000`, not
+independent partitions. These are raw MTD exports, not individual UBI-volume
+exports. The complete image is recommended for archival purposes. Do not
+upload a full-Flash or partition dump as a firmware recovery FIT or a
+chainloader update; restoration requires a separate, layout-aware procedure.
+
+Backups use a 64 KiB page-aligned cache and stream directly to the browser's
+download manager, without staging the entire image in U-Boot or JavaScript
+RAM. One download at a time is allowed; uploads and downloads are mutually
+exclusive. Backup endpoints never attach/format UBI, write Flash, save the
+environment or reboot. Treat backups as private device data.
+
+After editing the HTML, regenerate the committed embedded filesystem with
+`sh tools/xr1710g-makefsdata.sh`.
 
 ## Flashing Summary
 

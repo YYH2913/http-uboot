@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang='en'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>XR1710G Flash Backup</title>
+<style>
+:root{color-scheme:light;--bg:#f2f4f8;--ink:#1d2733;--muted:#6b7788;--line:#dfe4ec;--blue:#2878e3;--blue-dark:#1762c2;--blue-soft:#eaf2ff}
+*{box-sizing:border-box}
+html,body{min-height:100%;margin:0}
+body{color:var(--ink);background:var(--bg);font:14px Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,Microsoft YaHei,sans-serif}
+button,select{font:inherit}
+.app{min-height:100svh;display:grid;grid-template-columns:270px minmax(0,1fr);animation:page-in .28s ease both}
+.sidebar{min-height:100svh;display:flex;flex-direction:column;padding:30px 22px 24px;border-right:1px solid var(--line);background:#fff}
+.brand{padding:4px 8px 24px;border-bottom:1px solid var(--line)}
+.brand strong{display:block;font-size:17px;font-weight:780}
+.brand span{display:block;margin-top:6px;color:var(--muted);font-size:12px}
+.nav-label{margin:28px 8px 10px;color:#8b95a3;font-size:11px;font-weight:760;text-transform:uppercase}
+.nav{display:grid;gap:6px}
+.nav a{min-height:44px;display:flex;align-items:center;gap:11px;padding:0 12px;border:1px solid transparent;border-radius:7px;color:#354150;text-decoration:none;font-weight:650;transition:color .16s,background .16s,border-color .16s}
+.nav a:hover{color:var(--blue);background:#f6f9fe}
+.nav a[aria-current]{color:var(--blue-dark);border-color:#a9c8f4;background:var(--blue-soft)}
+.nav-dot{width:9px;height:9px;flex:0 0 9px;border-radius:50%;background:var(--blue);box-shadow:0 0 0 4px #2878e31a}
+.side-meta{margin-top:auto;padding:20px 8px 0;border-top:1px solid var(--line);color:var(--muted);font-size:11px;line-height:1.6;overflow-wrap:anywhere}
+.side-meta strong{display:block;color:#44505e}
+.main{min-width:0;display:flex;justify-content:center;align-items:flex-start;padding:42px 34px 30px}
+.workspace{width:min(760px,100%)}
+.panel{padding:32px 38px 30px;border:1px solid #cbd3df;border-radius:8px;background:#fff;box-shadow:0 12px 34px #2d405914}
+.heading{padding-bottom:24px;border-bottom:1px solid var(--line)}
+h1{margin:0;font-size:28px;line-height:1.25;font-weight:780}
+.source{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:22px 0;border-bottom:1px solid var(--line)}
+.source strong{font-size:18px}
+.source span{color:var(--muted);font-size:12px;text-align:right}
+.field{display:block;margin:26px 0 10px;font-size:13px;font-weight:700}
+select{display:block;width:100%;min-height:46px;padding:10px 12px;border:1px solid #cbd3df;border-radius:6px;background:#fff;color:var(--ink)}
+select:disabled{background:#f5f7fb;color:var(--muted)}
+.details{display:grid;grid-template-columns:1fr 1fr;gap:20px 24px;margin:24px 0 0;padding:22px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.details dt{margin:0;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase}
+.details dd{margin:7px 0 0;font-size:13px;font-weight:650;overflow-wrap:anywhere}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+.actions{display:flex;align-items:center;gap:12px;margin-top:26px;flex-wrap:wrap}
+button{min-height:44px;padding:0 20px;border:1px solid transparent;border-radius:6px;cursor:pointer;font-weight:700;transition:background .16s,color .16s,transform .16s}
+.primary{color:#fff;background:var(--blue)}
+.primary:hover:not(:disabled){background:var(--blue-dark);transform:translateY(-1px)}
+.secondary{color:#44505e;border-color:var(--line);background:#fff}
+.secondary:hover:not(:disabled){color:var(--blue);background:var(--blue-soft)}
+button:disabled{opacity:.5;cursor:default}
+:is(button,select,a):focus-visible{outline:3px solid #8db9f5;outline-offset:3px}
+.status{display:flex;align-items:baseline;gap:9px;margin:22px 0 0;line-height:1.65;min-height:44px}
+.status-dot{width:7px;height:7px;flex:0 0 7px;border-radius:50%;background:var(--blue)}
+.status[data-tone='working'] .status-dot{animation:pulse 1.2s ease-in-out infinite}
+.status[data-tone='error']{color:#b34338}
+.status[data-tone='error'] .status-dot{background:currentColor}
+.status span:last-child{font-size:12px}
+.notice{margin:16px 0 0;padding-top:18px;border-top:1px solid var(--line);color:var(--muted);font-size:12px;line-height:1.7}
+@keyframes page-in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes pulse{50%{opacity:.3}}
+@media(max-width:760px){.app{grid-template-columns:1fr}.sidebar{min-height:0;padding:16px;border-right:0;border-bottom:1px solid var(--line)}.brand{padding:0 2px 14px}.nav-label,.side-meta{display:none}.nav{grid-template-columns:1fr 1fr 1fr;gap:5px;margin-top:12px}.nav a{justify-content:center;padding:0 6px;font-size:12px}.nav-dot{display:none}.main{padding:18px 12px 24px}}
+@media(max-width:520px){.panel{padding:24px 18px 22px}h1{font-size:26px}.source{align-items:flex-start;flex-direction:column;gap:8px}.source span{text-align:left}.details{gap:18px 12px}.actions button{flex:1;padding:0 12px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class='app'>
+  <aside class='sidebar'>
+    <div class='brand'><strong>XR1710G Recovery Mode</strong><span>Recovery WebUI</span></div>
+    <p class='nav-label'>Recovery</p>
+    <nav class='nav' aria-label='Recovery'>
+      <a href='/'><span class='nav-dot'></span>Firmware Recovery</a>
+      <a href='/#uboot'><span class='nav-dot'></span>Update U-Boot</a>
+      <a href='/backup.html' aria-current='page'><span class='nav-dot'></span>Flash Backup</a>
+    </nav>
+    <div class='side-meta'><strong>192.168.255.1</strong><span id='version'>Read-only SPI-NAND backup</span></div>
+  </aside>
+  <main class='main'>
+    <div class='workspace'>
+      <section class='panel' aria-labelledby='page-title'>
+        <header class='heading'>
+          <h1 id='page-title'>Flash Backup</h1>
+        </header>
+        <div class='source'><strong id='capacity'>Checking SPI-NAND...</strong><span id='geometry'>Reading device information</span></div>
+        <label class='field' for='target'>Backup source</label>
+        <select id='target' disabled><option>Loading available partitions...</option></select>
+        <dl class='details'>
+          <div><dt>Source</dt><dd id='source-name'>—</dd></div>
+          <div><dt>Download size</dt><dd id='source-size'>—</dd></div>
+          <div><dt>Flash offset</dt><dd class='mono' id='source-offset'>—</dd></div>
+          <div><dt>End offset (exclusive)</dt><dd class='mono' id='source-end'>—</dd></div>
+        </dl>
+        <div class='actions'>
+          <button class='primary' id='download' type='button' disabled>Download Backup</button>
+          <button class='secondary' id='refresh' type='button'>Refresh Sources</button>
+        </div>
+        <p class='status' id='status' data-tone='working' role='status' aria-live='polite'><span class='status-dot'></span><span id='status-text'>Checking device availability...</span></p>
+        <p class='notice'>Read only · ECC corrected · No OOB. UBI layout views overlap. Verify the downloaded file size.</p>
+      </section>
+    </div>
+  </main>
+</div>
+<script>
+var sources=[];
+var deviceBusy=true;
+var checking=false;
+var target=document.getElementById('target');
+var download=document.getElementById('download');
+var refresh=document.getElementById('refresh');
+
+function formatBytes(bytes){
+  if(bytes<1024)return bytes+' B';
+  if(bytes<1048576)return(bytes/1024).toFixed(1)+' KiB';
+  return(bytes/1048576).toFixed(2).replace(/\.00$/,'')+' MiB';
+}
+function hex(value){return'0x'+value.toString(16).padStart(8,'0');}
+function status(text,tone){
+  document.getElementById('status-text').textContent=text;
+  document.getElementById('status').setAttribute('data-tone',tone||'idle');
+}
+function selectedSource(){
+  for(var i=0;i<sources.length;i++)if(sources[i].value===target.value)return sources[i];
+  return null;
+}
+function updateSource(){
+  var source=selectedSource();
+  download.disabled=checking||deviceBusy||!source;
+  if(!source)return;
+  document.getElementById('source-name').textContent=source.name;
+  document.getElementById('source-size').textContent=formatBytes(source.size)+' ('+source.size+' bytes)';
+  document.getElementById('source-offset').textContent=hex(source.offset);
+  document.getElementById('source-end').textContent=hex(source.offset+source.size);
+}
+async function checkSources(){
+  if(checking)return false;
+  checking=true;
+  refresh.disabled=true;
+  target.disabled=true;
+  download.disabled=true;
+  status('Checking device availability...','working');
+  var controller=new AbortController();
+  var timeout=setTimeout(function(){controller.abort();},10000);
+  try{
+    var response=await fetch('/backup/info',{cache:'no-store',signal:controller.signal});
+    if(!response.ok)throw new Error((await response.text()).trim()||'Cannot read backup sources.');
+    var data=await response.json();
+    if(!data||!data.size||!Array.isArray(data.partitions))throw new Error('Invalid backup information.');
+    var oldValue=target.value;
+    sources=[{value:'full',name:data.device+' / complete Flash',size:data.size,offset:0,url:'/backup/full.bin'}];
+    data.partitions.forEach(function(part){
+      sources.push({value:'mtd'+part.index,name:part.name+' (mtd'+part.index+')',size:part.size,offset:part.offset,url:'/backup/mtd'+part.index+'.bin'});
+    });
+    target.textContent='';
+    sources.forEach(function(source){
+      var option=document.createElement('option');
+      option.value=source.value;
+      option.textContent=source.name+' — '+formatBytes(source.size);
+      target.appendChild(option);
+    });
+    target.value=sources.some(function(source){return source.value===oldValue;})?oldValue:'full';
+    document.getElementById('capacity').textContent=data.device+' · '+formatBytes(data.size);
+    document.getElementById('geometry').textContent='Page '+formatBytes(data.page_size)+' / eraseblock '+formatBytes(data.erase_size);
+    deviceBusy=!!data.busy;
+    status(data.active?'Backup in progress.':deviceBusy?'Recovery is busy.':'Ready.',deviceBusy?'working':'idle');
+    return !deviceBusy;
+  }catch(error){
+    deviceBusy=true;
+    status(error.name==='AbortError'?'Device timed out. Check Ethernet and recovery mode, then refresh.':error.message,'error');
+    return false;
+  }finally{
+    clearTimeout(timeout);
+    checking=false;
+    refresh.disabled=false;
+    target.disabled=!sources.length;
+    updateSource();
+  }
+}
+target.addEventListener('change',updateSource);
+refresh.addEventListener('click',checkSources);
+download.addEventListener('click',async function(){
+  if(download.disabled)return;
+  if(!await checkSources())return;
+  var source=selectedSource();
+  if(!source)return;
+  deviceBusy=true;
+  updateSource();
+  status('Download started. Check browser downloads.','working');
+  // Native download streams to disk; never buffer a 512 MiB image in a Blob.
+  window.location.href=source.url;
+});
+checkSources();
+fetch('/about',{cache:'no-store'}).then(function(response){return response.json();}).then(function(data){
+  if(data.u_boot)document.getElementById('version').textContent=data.u_boot;
+}).catch(function(){});
+</script>
+</body>
+</html>

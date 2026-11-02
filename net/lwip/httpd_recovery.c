@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0+
 /*
- * Minimal HTTP upload recovery server using lwIP httpd
- * Serves a tiny upload page at / and handles POST to /upload/{firmware|uboot}
+ * HTTP recovery server using lwIP httpd, with read-only SPI-NAND backups.
+ * Serves recovery pages and handles POST to /upload/{firmware|uboot}.
  */
 
 #include <dm.h>
@@ -46,6 +46,7 @@
 #include <timer.h>
 #include <asm/io.h>
 #include "../../drivers/mtd/ubi/ubi.h"
+#include "httpd_recovery.h"
 
 DECLARE_GLOBAL_DATA_PTR;
 
@@ -2553,7 +2554,7 @@ static const char recovery_page_ok[] =
 	"\r\n"
 	"OK";
 
-static int recovery_open_custom_response(struct fs_file *file,
+int recovery_open_custom_response(struct fs_file *file, const char *status,
 					 const char *content_type,
 					 const char *body, int body_len)
 {
@@ -2566,13 +2567,13 @@ static int recovery_open_custom_response(struct fs_file *file,
 		return 0;
 
 	header_len = snprintf(header, sizeof(header),
-			      "HTTP/1.0 200 OK\r\n"
+			      "HTTP/1.0 %s\r\n"
 			      "Content-Type: %s\r\n"
 			      "Cache-Control: no-store\r\n"
 			      "Content-Length: %d\r\n"
 			      "Connection: close\r\n"
 			      "\r\n",
-			      content_type, body_len);
+			      status, content_type, body_len);
 	if (header_len < 0 || header_len >= (int)sizeof(header))
 		return 0;
 
@@ -2595,71 +2596,74 @@ static int recovery_open_custom_response(struct fs_file *file,
 /* lwIP httpd custom file hooks: serve only dynamic endpoints; static files via fsdata */
 int fs_open_custom(struct fs_file *file, const char *name)
 {
-    const char *p;
-    if (!file || !name)
-        return 0;
+	const char *p;
 
-    /* Normalize leading slash to make httpd default filenames work */
-    p = name;
-    if (*p == '/')
-        p++;
+	if (!file || !name)
+		return 0;
+	file->pextension = NULL;
+	/* Normalize the slash used by httpd's default filenames. */
+	p = *name == '/' ? name + 1 : name;
 
+	if (!strncmp(p, "backup/", 7))
+		return recovery_backup_open(file, p, post_ok || flash_request ||
+					    reboot_request || prog_phase > 0);
+	if (!strcmp(p, "status")) {
+		char json[256];
+		int json_len = snprintf(json, sizeof(json),
+			"{\"in_progress\":%d,\"done\":%u,\"total\":%u,"
+			"\"erase_done\":%u,\"erase_total\":%u,"
+			"\"write_done\":%u,\"write_total\":%u,"
+			"\"ok\":%d,\"error\":%d,\"phase\":%d}\n",
+			prog_phase > 0 && prog_phase < 3,
+			(unsigned int)prog_done, (unsigned int)prog_total,
+			(unsigned int)prog_erase_done, (unsigned int)prog_erase_total,
+			(unsigned int)prog_write_done, (unsigned int)prog_write_total,
+			prog_phase == 3, prog_phase == -1, prog_phase);
 
-	    if (!strcmp(p, "status")) {
-        char json[256];
-        int ok = (prog_phase == 3);
-        int err = (prog_phase == -1);
-        int json_len = snprintf(json, sizeof(json),
-                                "{\"in_progress\":%d,\"done\":%u,\"total\":%u,\"erase_done\":%u,\"erase_total\":%u,\"write_done\":%u,\"write_total\":%u,\"ok\":%d,\"error\":%d,\"phase\":%d}\n",
-                                prog_phase > 0 && prog_phase < 3,
-                                (unsigned)prog_done, (unsigned)prog_total,
-                                (unsigned)prog_erase_done, (unsigned)prog_erase_total,
-                                (unsigned)prog_write_done, (unsigned)prog_write_total,
-                                ok, err, prog_phase);
-        if (json_len < 0)
-            return 0;
-        if (json_len >= (int)sizeof(json))
-            json_len = (int)sizeof(json) - 1;
-
-        return recovery_open_custom_response(file, "application/json",
-					     json, json_len);
-	    }
-	    else if (!strcmp(p, "ok")) {
+		if (json_len < 0 || json_len >= (int)sizeof(json))
+			return 0;
+		return recovery_open_custom_response(file, "200 OK",
+					     "application/json", json, json_len);
+	}
+	if (!strcmp(p, "ok")) {
 		file->data = recovery_page_ok;
 		file->len = sizeof(recovery_page_ok) - 1;
 		file->index = file->len;
 		file->flags = FS_FILE_FLAGS_HEADER_INCLUDED;
 		return 1;
-	    }
-	    else if (!strcmp(p, "about")) {
-	        char json[256];
-	        int json_len =
-#ifdef U_BOOT_DATE
-	            snprintf(json, sizeof(json),
-	                     "{\"u_boot\":\"%s (%s - %s %s)\",\"detected_layout\":\"%s\"}\n",
-	                     U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME, U_BOOT_TZ,
-	                     xr1710g_detect_ubi_version());
-#else
-	            snprintf(json, sizeof(json),
-	                     "{\"u_boot\":\"%s\",\"detected_layout\":\"%s\"}\n",
-	                     U_BOOT_VERSION, xr1710g_detect_ubi_version());
-#endif
-        if (json_len < 0)
-            return 0;
-        if (json_len >= (int)sizeof(json))
-            json_len = (int)sizeof(json) - 1;
+	}
+	if (!strcmp(p, "about")) {
+		char json[256];
+		int json_len;
 
-        return recovery_open_custom_response(file, "application/json",
-					     json, json_len);
-    }
-    /* Do not intercept favicon/index/ok/fail: served by fsdata */
-    /* let fsdata handle others */
-    return 0;
+#ifdef U_BOOT_DATE
+		json_len = snprintf(json, sizeof(json),
+			"{\"u_boot\":\"%s (%s - %s %s)\",\"detected_layout\":\"%s\"}\n",
+			U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME, U_BOOT_TZ,
+			xr1710g_detect_ubi_version());
+#else
+		json_len = snprintf(json, sizeof(json),
+			"{\"u_boot\":\"%s\",\"detected_layout\":\"%s\"}\n",
+			U_BOOT_VERSION, xr1710g_detect_ubi_version());
+#endif
+		if (json_len < 0 || json_len >= (int)sizeof(json))
+			return 0;
+		return recovery_open_custom_response(file, "200 OK",
+					     "application/json", json, json_len);
+	}
+	/* Static pages, including backup.html, come from fsdata. */
+	return 0;
 }
 
 void fs_close_custom(struct fs_file *file)
 {
-	if (file && file->data && file->data != recovery_page_ok) {
+	if (!file)
+		return;
+	if (file->pextension) {
+		recovery_backup_close(file);
+		return;
+	}
+	if (file->data && file->data != recovery_page_ok) {
 		free((void *)file->data);
 		file->data = NULL;
 	}
@@ -2667,20 +2671,23 @@ void fs_close_custom(struct fs_file *file)
 
 int fs_read_custom(struct fs_file *file, char *buffer, int count)
 {
-    u32_t left;
-    if (!file || !buffer || count <= 0)
-        return FS_READ_EOF;
-    left = file->len - file->index;
-    if (left <= 0)
-        return FS_READ_EOF;
-    if ((u32_t)count > left)
-        count = left;
-    memcpy(buffer, file->data + file->index, count);
-    file->index += count;
-    return count;
+	int left;
+
+	if (!file || !buffer || count <= 0)
+		return FS_READ_EOF;
+	if (file->pextension)
+		return recovery_backup_read(file, buffer, count);
+	left = file->len - file->index;
+	if (left <= 0)
+		return FS_READ_EOF;
+	if (count > left)
+		count = left;
+	memcpy(buffer, file->data + file->index, count);
+	file->index += count;
+	return count;
 }
 
-/* Complete custom responses are supplied in file->data by fs_open_custom(). */
+/* Backup streams use fs_read_custom(); small responses use file->data. */
 
 /* HTTP POST handlers */
 err_t httpd_post_begin(void *connection, const char *uri, const char *http_request,
@@ -2693,10 +2700,11 @@ err_t httpd_post_begin(void *connection, const char *uri, const char *http_reque
      * images that are much larger than a typical lwIP POST body and manual
      * window updates avoid over-optimistic receive windows.
      */
-    if (post_auto_wnd)
-        *post_auto_wnd = 0;
+	if (post_auto_wnd)
+		*post_auto_wnd = 0;
 
-    if (post_ok || flash_request || reboot_request || prog_phase > 0) {
+	if (recovery_backup_active() || post_ok || flash_request ||
+	    reboot_request || prog_phase > 0) {
         printf("httpd: rejecting upload while recovery flash is busy (phase=%d)\n",
                prog_phase);
         strlcpy(response_uri, "/fail.html", response_uri_len);
