@@ -164,7 +164,8 @@ The **eMMC layout** page changes the supported partition profile.
 - All migration profiles use LBA `110626` as the preserved-prefix boundary.
 - The warning describes which tail definition will be replaced and which firmware must be uploaded before rebooting.
 - The action remains disabled until the exact token `SBE1V1K_REPARTITION` is entered.
-- The migration verifies fixed factory anchors, preserves the running FIT, writes and verifies the new GPT, reinstalls the FIT in the new target, and updates and verifies `0:APPSBLENV`.
+- The migration verifies fixed factory anchors, preserves and validates the running FIT, writes and verifies the new GPT, then installs the FIT in the target partition. It compares the complete FIT readback and verifies its hashes before updating and verifying `0:APPSBLENV`.
+- If the selected layout already matches, the GPT and system partitions are left unchanged, but the chainloader is still installed and readback-verified before the boot environment is updated. This applies to all three profiles.
 - The HTTP server remains active after migration so matching firmware can be installed before rebooting.
 
 Migration rewrites partition definitions and boot configuration. It cannot restore data that an earlier layout already overwrote.
@@ -288,7 +289,7 @@ This profile rebuilds the factory-compatible tail and uses the otherwise empty `
 
 The `qwrt` profile supports compatible QWRT firmware.
 
-The QWRT profile preserves the chainloader in `rsvd_2` and provides the matching boot configuration.
+The QWRT profile installs and fully readback-verifies the chainloader in `rsvd_2` before updating the matching boot configuration, including when the GPT already matches.
 
 ### Layout Detection and Migration
 
@@ -308,7 +309,7 @@ The layout migration uses a separate set of prefix safety checks:
 3. If P26 is absent, copy P25 `0:HLOS` to LBAs `96290..110625` in chunks and compare each destination chunk before changing the GPT.
 4. Build the selected GPT with P26 `0:HLOS_1`, run `gpt write`, and verify the new prefix and target layout exactly.
 5. Erase the new chainloader target and reinstall the preserved FIT.
-6. Update `bootargs`, `boot_chainloader`, `do_boot`, `do_nothing`, and `bootcmd` in `0:APPSBLENV`, recalculate its CRC, and verify a complete readback.
+6. Compare the complete installed chainloader FIT against the preserved image and verify its internal hashes. Only then update `bootargs`, `boot_chainloader`, `do_boot`, `do_nothing`, `bootcmd`, and the profile marker in `0:APPSBLENV`, recalculate its CRC, and verify a complete environment readback.
 
 Converting from `large` back to `mainline` restores partition definitions only. It cannot restore factory tail data that was previously overwritten.
 

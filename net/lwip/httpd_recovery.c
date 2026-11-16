@@ -4409,6 +4409,92 @@ static int recovery_preserve_chainloader_fit(void **fitp, size_t *fit_sizep)
 	return ret;
 }
 
+static int recovery_validate_chainloader_fit(const void *fit, size_t fit_size)
+{
+	int ret;
+
+	if (!fit || fit_size < sizeof(struct fdt_header) ||
+	    fit_size > RECOVERY_MAX_UBOOT_SIZE_MMC ||
+	    fit_size > recovery_uboot_limit())
+		return -EINVAL;
+	ret = recovery_verify_fit_payload(fit, fit_size);
+	if (ret)
+		return ret;
+	return recovery_is_sbe1v1k_chainloader_fit(fit, fit_size) ? 0 : -ENOEXEC;
+}
+
+static int
+recovery_install_chainloader_fit(const struct recovery_sbe1v1k_layout_desc *layout,
+				 struct recovery_status_led_ctrl *status_leds,
+				 const void *fit, size_t fit_size,
+				 u32 erase_progress_base, size_t write_progress_base)
+{
+	struct disk_partition part;
+	struct blk_desc *desc;
+	u8 *readback;
+	ulong blksz;
+	size_t read_size;
+	lbaint_t blocks;
+	int ret;
+
+	if (!layout)
+		return -EINVAL;
+	ret = recovery_validate_chainloader_fit(fit, fit_size);
+	if (ret)
+		return ret;
+
+	ret = recovery_get_mmc_part(layout->uboot_part, &desc, &part);
+	if (ret)
+		return ret;
+	blksz = part.blksz ?: desc->blksz;
+	if (desc->blksz != 512 || blksz != 512 ||
+	    part.start != layout->uboot_start ||
+	    part.size != layout->uboot_size)
+		return -EINVAL;
+	if (fit_size > recovery_mmc_part_bytes(&part))
+		return -EFBIG;
+	/* Reserve verification memory before erasing the installed boot image. */
+	read_size = ALIGN(fit_size, blksz);
+	blocks = read_size / blksz;
+	readback = memalign(ARCH_DMA_MINALIGN, read_size);
+	if (!readback)
+		return -ENOMEM;
+
+	prog_phase = 1;
+	ret = recovery_mmc_erase_part(layout->uboot_part, status_leds,
+				      erase_progress_base);
+	if (ret)
+		goto out;
+	prog_phase = 2;
+	ret = recovery_mmc_write_part(layout->uboot_part, status_leds,
+				      fit, fit_size, write_progress_base);
+	if (ret)
+		goto out;
+
+	if (blk_dread(desc, part.start, blocks, readback) != blocks) {
+		printf("Failed to read back chainloader FIT from '%s'\n",
+		       layout->uboot_part);
+		ret = -EIO;
+		goto out;
+	}
+	if (memcmp(readback, fit, fit_size)) {
+		printf("Chainloader FIT readback mismatch in '%s'\n",
+		       layout->uboot_part);
+		ret = -EIO;
+		goto out;
+	}
+	ret = recovery_validate_chainloader_fit(readback, fit_size);
+	if (ret)
+		goto out;
+	recovery_service_runtime(status_leds);
+	recovery_debug_printf("Chainloader FIT write and full readback verified in '%s'\n",
+			      layout->uboot_part);
+
+out:
+	free(readback);
+	return ret;
+}
+
 static int recovery_load_appsblenv(u8 **bufp, size_t *env_bytesp,
 				   struct blk_desc **descp,
 				   struct disk_partition *partp)
@@ -4935,58 +5021,78 @@ out:
 	return ret;
 }
 
-static int recovery_select_sbe1v1k_qwrt_profile(
-	struct recovery_status_led_ctrl *status_leds)
+static int
+recovery_select_sbe1v1k_profile(struct recovery_status_led_ctrl *status_leds,
+				const struct recovery_sbe1v1k_layout_desc *layout)
 {
 	char auth_code[RECOVERY_QWRT_AUTH_CODE_LEN + 1];
+	void *chainloader_fit;
+	size_t chainloader_size;
 	int ret;
 
 	if (recv_off != strlen(RECOVERY_SBE1V1K_REPARTITION_TOKEN) ||
 	    memcmp(recv_base, RECOVERY_SBE1V1K_REPARTITION_TOKEN,
 		   strlen(RECOVERY_SBE1V1K_REPARTITION_TOKEN))) {
-		printf("Invalid QWRT profile confirmation token\n");
+		printf("Invalid profile confirmation token\n");
 		return -EINVAL;
 	}
 
-	if (!recovery_backend_is_mmc())
+	if (!layout || !recovery_backend_is_mmc())
 		return -EINVAL;
 
 	/* Fail before touching eMMC when the device identity is unavailable. */
-	ret = recovery_qwrt_auth_code(auth_code);
-	recovery_qwrt_secure_zero(auth_code, sizeof(auth_code));
-	if (ret) {
-		printf("Cannot authorize QWRT profile from the device serial: %d\n",
-		       ret);
+	if (layout->id == RECOVERY_SBE1V1K_LAYOUT_QWRT) {
+		ret = recovery_qwrt_auth_code(auth_code);
+		recovery_qwrt_secure_zero(auth_code, sizeof(auth_code));
+		if (ret) {
+			printf("Cannot authorize QWRT profile from the device serial: %d\n",
+			       ret);
+			return ret;
+		}
+	}
+
+	ret = recovery_verify_sbe1v1k_gpt(layout, true);
+	if (ret)
 		return ret;
-	}
+	ret = recovery_preserve_chainloader_fit(&chainloader_fit, &chainloader_size);
+	if (ret)
+		return ret;
+	ret = recovery_validate_chainloader_fit(chainloader_fit, chainloader_size);
+	if (ret)
+		goto out;
+	ret = recovery_check_appsblenv();
+	if (ret)
+		goto out;
 
-	if (recovery_verify_sbe1v1k_gpt(&sbe1v1k_layout_qwrt, false)) {
-		printf("QWRT profile requires an existing verified factory-compatible GPT\n");
-		return -EINVAL;
-	}
-
-	prog_phase = 2;
+	prog_phase = 1;
 	prog_erase_done = 0;
-	prog_erase_total = 0;
+	prog_erase_total = RECOVERY_MMC_ERASE_PROGRESS_STEPS;
 	prog_write_done = 0;
-	prog_write_total = RECOVERY_APPSBLENV_SIZE;
-	prog_total = prog_write_total;
+	prog_write_total = chainloader_size + RECOVERY_APPSBLENV_SIZE;
+	prog_total = prog_erase_total + prog_write_total;
 	prog_done = 0;
 	recovery_service_runtime(status_leds);
 
-	ret = recovery_write_appsblenv(status_leds, 0, &sbe1v1k_layout_qwrt);
+	ret = recovery_install_chainloader_fit(layout, status_leds,
+					       chainloader_fit, chainloader_size, 0, 0);
 	if (ret)
-		return ret;
+		goto out;
+	ret = recovery_write_appsblenv(status_leds, chainloader_size, layout);
+	if (ret)
+		goto out;
 
-	ret = recovery_apply_sbe1v1k_layout(&sbe1v1k_layout_qwrt);
+	ret = recovery_apply_sbe1v1k_layout(layout);
 	if (ret)
-		return ret;
+		goto out;
 
 	prog_write_done = prog_write_total;
 	prog_done = prog_total;
 	recovery_service_runtime(status_leds);
-	recovery_debug_printf("SBE1V1K QWRT profile selected; auth_code refreshed without repartition\n");
-	return 0;
+	recovery_debug_printf("SBE1V1K '%s' profile selected; chainloader installed and verified\n",
+			      layout->name);
+out:
+	free(chainloader_fit);
+	return ret;
 }
 
 static int recovery_repartition_factory(
@@ -5041,6 +5147,9 @@ static int recovery_repartition_factory(
 	if (ret)
 		return ret;
 
+	ret = recovery_validate_chainloader_fit(chainloader_fit, chainloader_size);
+	if (ret)
+		goto out;
 	ret = recovery_check_appsblenv();
 	if (ret)
 		goto out;
@@ -5106,19 +5215,9 @@ static int recovery_repartition_factory(
 	prog_done = prog_erase_done + prog_write_done;
 	recovery_service_runtime(status_leds);
 
-	prog_phase = 1;
-	ret = recovery_mmc_erase_part(layout->uboot_part,
-					      status_leds, erase_progress_base);
-	if (ret)
-		goto out;
-	prog_phase = 2;
-
-	recovery_debug_printf("Writing preserved chainloader FIT to '%s'...\n",
-			      layout->uboot_part);
-	ret = recovery_mmc_write_part(layout->uboot_part,
-					      status_leds, chainloader_fit,
-					      chainloader_size,
-					      write_progress + 2);
+	ret = recovery_install_chainloader_fit(layout, status_leds,
+					       chainloader_fit, chainloader_size,
+					       erase_progress_base, write_progress + 2);
 	if (ret)
 		goto out;
 
@@ -5143,6 +5242,21 @@ static int recovery_repartition_factory(
 out:
 	free(chainloader_fit);
 	return ret;
+}
+
+static int
+recovery_change_sbe1v1k_profile(struct recovery_status_led_ctrl *status_leds,
+				enum recovery_sbe1v1k_layout layout_id)
+{
+	const struct recovery_sbe1v1k_layout_desc *layout =
+		recovery_sbe1v1k_layout_desc(layout_id);
+
+	if (!layout)
+		return -EINVAL;
+	if (!recovery_verify_sbe1v1k_gpt(layout, true))
+		return recovery_select_sbe1v1k_profile(status_leds, layout);
+
+	return recovery_repartition_factory(status_leds, layout_id);
 }
 
 static int recovery_flash_mmc_firmware(struct recovery_status_led_ctrl *status_leds)
@@ -8344,13 +8458,8 @@ static int flash_image(struct recovery_status_led_ctrl *status_leds)
 
 	if (current_target == TARGET_REPARTITION) {
 		prog_reboot = 0;
-		if (current_repartition_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT &&
-		    (active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_MAINLINE ||
-		     active_sbe1v1k_layout == RECOVERY_SBE1V1K_LAYOUT_QWRT))
-			ret = recovery_select_sbe1v1k_qwrt_profile(status_leds);
-		else
-			ret = recovery_repartition_factory(status_leds,
-							   current_repartition_layout);
+		ret = recovery_change_sbe1v1k_profile(status_leds,
+						      current_repartition_layout);
 		if (ret) {
 			printf("SBE1V1K profile operation failed: %d\n", ret);
 			prog_phase = -1;
